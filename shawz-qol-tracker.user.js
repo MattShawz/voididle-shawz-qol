@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SHaWZ QoL Tracker
 // @namespace    https://github.com/MattShawz/voididle-shawz-qol
-// @version      1.1.0
+// @version      1.2.0
 // @description  QoL addon for voididle.com — Gear Finder with inventory highlighting, Team tab with party stats, berserk tracker, session rates, leaderboard ranks, zone events and more.
 // @author       MattShawz
 // @match        https://voididle.com/*
@@ -484,55 +484,168 @@
     // Calculate MP/10s required to sustain all active skills.
     // Reads each .skill-row-active, extracts MP cost and cooldown in seconds,
     // sums (cost / cooldown) × 10 across all active skills.
+    // Mana costs for flat mana/5s imbues by weapon type
+    const IMBUE_MANA_PER_5S = {
+        'Battle March': 8,
+        'Guard Rhythm': 8,
+        'Mana Sonata':  3,
+        'Hymn of Life': 9,
+    };
+
+    // Mana costs for mana/hit imbues (weapon type → cost)
+    const IMBUE_MANA_PER_HIT = {
+        'Withering Wind': 3, // Fan
+        'Flame Edge':     3, // Sword
+        'Venom Tip':      2, // Bow
+        'Stone Skin':     3, // Spear — mana per hit received, use estimate
+    };
+
+    // Arcane Charge (Staff) — mana/hit by rank
+    const ARCANE_CHARGE_MANA = { 1:5, 2:6, 3:8, 4:9 };
+
+    function getAttackIntervalMs() {
+        // Prefer character stats panel — "Attack Speed" e.g. "1.76/s" or "1.76 atk/s"
+        const atkRaw = state.party[state.selfName]?.stats?.['Attack Speed'] || '';
+        const atkMatch = atkRaw.match(/([\d.]+)/);
+        if (atkMatch) return Math.round(1000 / parseFloat(atkMatch[1]));
+        // Fallback: read from combat attack bar animation duration
+        const selfCard = document.querySelector('.cc-pm-card.cc-pm-you .cc-attack-bar-fill');
+        if (selfCard) {
+            const anim = selfCard.style.animation || '';
+            const ms = anim.match(/(\d+)ms/);
+            if (ms) return parseInt(ms[1]);
+        }
+        return 2000; // default 2s
+    }
+
+    function getHitChance() {
+        // "Hit Chance" stat e.g. "94%" or "94.5%"
+        const raw = state.party[state.selfName]?.stats?.['Hit Chance'] ||
+                    state.party[state.selfName]?.stats?.['Hit Rate'] || '';
+        const m = raw.match(/([\d.]+)/);
+        return m ? Math.min(1, parseFloat(m[1]) / 100) : 1.0; // default 100%
+    }
+
+    function getArcaneChargeRank() {
+        // Look for Arcane Charge node in ability tree SVG
+        // The rank is shown in a text element near the "Arcane Charge" label
+        const svgTexts = [...document.querySelectorAll('svg text')];
+        const acLabel = svgTexts.find(t => t.textContent.trim() === 'Arcane Charge');
+        if (!acLabel) return 0;
+        // Look for a rank number in nearby text elements (same parent group)
+        const group = acLabel.closest('g');
+        if (!group) return 0;
+        const rankText = [...group.querySelectorAll('text')]
+            .map(t => t.textContent.trim())
+            .find(t => /^[1-4]$/.test(t));
+        return parseInt(rankText) || 1; // default rank 1 if found but no number
+    }
+
     function calcManaRequired() {
-        const rows = document.querySelectorAll('.skill-row.skill-row-active');
         let mpPer10s = 0;
-        rows.forEach(row => {
-            const costEl = row.querySelector('.skill-mana-cost');
-            const metaEl = row.querySelector('.skill-row-meta');
-            if (!costEl || !metaEl) return;
+        const breakdown = [];
 
-            // MP cost: "58 MP" → 58
-            const cost = parseFloat(costEl.textContent.replace(/[^\d.]/g,'')) || 0;
-
-            // Cooldown: meta text is "58 MP · 22.1s · 3.4s remaining"
-            // First number after · is the full cooldown
-            const metaText = metaEl.textContent;
-            const cdMatch  = metaText.match(/·\s*([\d.]+)s/);
-            const cd       = cdMatch ? parseFloat(cdMatch[1]) : 0;
-
-            if (cost > 0 && cd > 0) {
-                mpPer10s += (cost / cd) * 10;
-            }
-        });
-
-        // Add aura mana drain — visible as "X MP/5s" in .aura-header-summary
-        const auraSummary = document.querySelector('.aura-header-summary');
-        if (auraSummary) {
-            const auraText = auraSummary.textContent || '';
-            // Aura shows "+1.49% MP/5s" — convert to per 10s absolute value
-            const auraPctMatch = auraText.match(/([\d.]+)%\s*MP\/5s/i);
-            if (auraPctMatch) {
-                const maxMana = parseFloat(
-                    (document.querySelector('.cc-bar-intext') || {textContent:''})
-                        .textContent.split('/')[1]?.replace(/[^\d.]/g,'')
-                ) || parseFloat(
-                    (state.party[state.selfName]?.stats?.['Max Mana']||'0').replace(/,/g,'')
-                ) || 0;
-                if (maxMana > 0) {
-                    const auraDrainPer5s = (parseFloat(auraPctMatch[1])/100) * maxMana;
-                    mpPer10s += auraDrainPer5s * 2; // per 10s
+        // ── 1. Skills ─────────────────────────────────────────────────────────
+        let skillMp = 0;
+        const mabBar = document.querySelector('.mab-bar');
+        if (mabBar) {
+            // Use cached costs from popover reads (most reliable)
+            const cache = window._shawzMabCache?.skills || {};
+            Object.values(cache).forEach(({ cost, cd }) => {
+                if (cost > 0 && cd > 0) skillMp += (cost / cd) * 10;
+            });
+            // Fallback: try reading mana cost directly from slots if cache empty
+            if (skillMp === 0) {
+                const abGroup = [...mabBar.querySelectorAll('.mab-group')]
+                    .find(g => g.querySelector('.mab-group-label')?.textContent.trim() === 'Abilities');
+                if (abGroup) {
+                    abGroup.querySelectorAll('.mab-slot-active').forEach(btn => {
+                        const cost = parseFloat(btn.querySelector('.mab-mana-cost')?.textContent) || 0;
+                        const cd   = parseFloat((btn.querySelector('.mab-cd-text')?.textContent||'').replace(/[^\d.]/g,'')) || 0;
+                        if (cost > 0 && cd > 0) skillMp += (cost / cd) * 10;
+                    });
                 }
             }
-            // Also handle flat "X MP/5s" format
-            const auraFlatMatch = auraText.match(/([\d.]+)\s*MP\/5s/i);
-            if (auraFlatMatch && !auraPctMatch) {
-                mpPer10s += parseFloat(auraFlatMatch[1]) * 2;
+        } else {
+            document.querySelectorAll('.skill-row.skill-row-active').forEach(row => {
+                const costEl = row.querySelector('.skill-mana-cost');
+                const metaEl = row.querySelector('.skill-row-meta');
+                if (!costEl || !metaEl) return;
+                const cost = parseFloat(costEl.textContent.replace(/[^\d.]/g,'')) || 0;
+                const cdM  = metaEl.textContent.match(/·\s*([\d.]+)s/);
+                const cd   = cdM ? parseFloat(cdM[1]) : 0;
+                if (cost > 0 && cd > 0) skillMp += (cost / cd) * 10;
+            });
+        }
+        if (skillMp > 0) { mpPer10s += skillMp; breakdown.push({ label:'skills', value: skillMp }); }
+
+        // ── 2. Aura drain ─────────────────────────────────────────────────────
+        // Try mab cache first, then live aura-header-summary
+        const cachedAura = window._shawzMabCache?.auraMpPer5s;
+        const maxMana = parseFloat((state.party[state.selfName]?.stats?.['Max Mana']||'0').replace(/,/g,'')) || 0;
+        if (cachedAura && typeof cachedAura === 'object') {
+            let v = 0;
+            if (cachedAura.pct && maxMana > 0) v = (cachedAura.pct / 100) * maxMana * 2;
+            else if (cachedAura.flat) v = cachedAura.flat * 2;
+            if (v > 0) { mpPer10s += v; breakdown.push({ label:'aura', value: v }); }
+        } else {
+            const auraSummary = document.querySelector('.aura-header-summary');
+            if (auraSummary) {
+                const auraText = auraSummary.textContent || '';
+                const auraPct  = auraText.match(/([\d.]+)%\s*MP\/5s/i);
+                if (auraPct && maxMana > 0) {
+                    const v = (parseFloat(auraPct[1]) / 100) * maxMana * 2;
+                    mpPer10s += v; breakdown.push({ label:'aura', value: v });
+                } else {
+                    const auraFlat = auraText.match(/([\d.]+)\s*MP\/5s/i);
+                    if (auraFlat) { const v = parseFloat(auraFlat[1]) * 2; mpPer10s += v; breakdown.push({ label:'aura', value: v }); }
+                }
             }
         }
 
-        return mpPer10s;
+        // ── 3. Imbues ─────────────────────────────────────────────────────────
+        // Use cached imbue list from popover, fall back to live UI
+        let activeImbues = window._shawzMabCache?.imbues?.length
+            ? window._shawzMabCache.imbues
+            : [...document.querySelectorAll('.virtuoso-imbue-pill.active')]
+                .map(btn => btn.getAttribute('title')?.replace(/\s*—.*$/,'').trim()).filter(Boolean);
+
+        if (!activeImbues.length && mabBar) {
+            const ig = [...mabBar.querySelectorAll('.mab-group')]
+                .find(g => g.querySelector('.mab-group-label')?.textContent.trim() === 'Imbue');
+            if (ig) activeImbues = [...ig.querySelectorAll('.mab-slot-active')]
+                .map(btn => (btn.getAttribute('aria-label')||'').replace(/^imbue:\s*/i,'')
+                    .replace(/_/g,' ').replace(/\b\w/g,c=>c.toUpperCase()).trim()).filter(Boolean);
+        }
+        if (activeImbues.length > 0) {
+            const hitsPerTen = (10000 / getAttackIntervalMs()) * getHitChance();
+            activeImbues.forEach(name => {
+                let v = 0;
+                if      (IMBUE_MANA_PER_5S[name]  !== undefined) v = IMBUE_MANA_PER_5S[name] * 2;
+                else if (name === 'Stone Skin')                   v = IMBUE_MANA_PER_HIT['Stone Skin'] * (10/3);
+                else if (name === 'Arcane Charge')                v = (ARCANE_CHARGE_MANA[getArcaneChargeRank()] || 5) * hitsPerTen;
+                else if (IMBUE_MANA_PER_HIT[name] !== undefined)  v = IMBUE_MANA_PER_HIT[name] * hitsPerTen;
+                if (v > 0) { mpPer10s += v; breakdown.push({ label: name, value: v }); }
+            });
+        }
+
+        return { total: mpPer10s, breakdown };
     }
+
+    // Segment colours for each drain source
+    const MANA_SEG_COLORS = {
+        skills:        '#534AB7',
+        aura:          '#1D9E75',
+        'Battle March':'#BA7517',
+        'Guard Rhythm':'#D85A30',
+        'Mana Sonata': '#378ADD',
+        'Hymn of Life':'#993556',
+        'Flame Edge':  '#E05555',
+        'Venom Tip':   '#55BB55',
+        'Withering Wind':'#DD55AA',
+        'Stone Skin':  '#5599DD',
+        'Arcane Charge':'#BB77EE',
+    };
 
     // Scrape YOUR OWN stats from .cv-stats-grid (always available on your char page).
     // Merges into existing stats so data from a previous scrape isn't wiped
@@ -606,18 +719,37 @@
 
         // Mana regen calculation — only update if skills panel is visible
         const skillRows = document.querySelectorAll('.skill-row.skill-row-active');
-        if (skillRows.length > 0) {
-            const mpRequired = calcManaRequired();
-            stats.__mpRequired = mpRequired;
+        const mabAbilities = document.querySelectorAll('.mab-group .mab-slot-active');
+        if (skillRows.length > 0 || mabAbilities.length > 0) {
+            const mpResult   = calcManaRequired();
+            const mpRequired = mpResult.total;
+            stats.__mpRequired  = mpRequired;
+            stats.__mpBreakdown = mpResult.breakdown;
 
-            // Actual mana regen from stat (may come from grid above)
+            // Build imbue list for display — check both UIs
+            let activeImbueNames = [...document.querySelectorAll('.virtuoso-imbue-pill.active')]
+                .map(btn => btn.getAttribute('title')?.replace(/\s*—.*$/,'').trim())
+                .filter(Boolean);
+            if (!activeImbueNames.length) {
+                const mabImbue = [...document.querySelectorAll('.mab-group')]
+                    .find(g => g.querySelector('.mab-group-label')?.textContent.trim() === 'Imbue');
+                if (mabImbue) {
+                    activeImbueNames = [...mabImbue.querySelectorAll('.mab-slot-active')]
+                        .map(btn => (btn.getAttribute('aria-label')||'')
+                            .replace(/^imbue:\s*/i,'').replace(/_/g,' ')
+                            .replace(/\b\w/g,c=>c.toUpperCase()).trim())
+                        .filter(Boolean);
+                }
+            }
+            stats.__mpImbues = activeImbueNames;
+
+            // Actual mana regen from stat
             const manaRegenRaw   = stats['Mana Regen'] || '';
             const manaRegenMatch = manaRegenRaw.match(/([\d.]+)/);
             const mpActual       = manaRegenMatch ? parseFloat(manaRegenMatch[1]) : (stats.__mpActual || 0);
             stats.__mpActual  = mpActual;
             stats.__mpDelta   = mpActual - mpRequired;
         }
-        // If skills not visible, keep whatever __mpRequired/__mpDelta we had before
 
         if (!state.party[state.selfName]) {
             state.party[state.selfName] = { name: state.selfName, isSelf: true };
@@ -745,6 +877,54 @@
     //   5. Navigate back to Combat tab
     //   6. Call onDone()
     let inspectBusy = false;
+    // Click through mab-bar slots to populate the skill/imbue/aura cache
+    function scrapeMabBar(onDone) {
+        const mabBar = document.querySelector('.mab-bar');
+        if (!mabBar) { if (onDone) onDone(); return; }
+
+        if (!window._shawzMabCache) window._shawzMabCache = { skills:{}, imbues:[], auraMpPer5s:0 };
+        // Reset imbues so we don't accumulate stale entries
+        window._shawzMabCache.imbues = [];
+
+        // Collect all clickable slots: abilities, aura, imbue slots
+        const slots = [...mabBar.querySelectorAll('.mab-slot.mab-slot-active, .mab-slot[aria-label^="Aura"], .mab-slot[aria-label^="Imbue"]')]
+            .filter(btn => !btn.querySelector('.mab-slot-plus')); // skip empty slots
+
+        if (!slots.length) { if (onDone) onDone(); return; }
+
+        let si = 0;
+        function nextSlot() {
+            // Close any open popover first
+            const existing = document.querySelector('.mab-popover');
+            if (existing) {
+                const closeBtn = existing.querySelector('.mab-popover-close:not(.mab-popover-danger)');
+                if (closeBtn) closeBtn.click();
+            }
+
+            if (si >= slots.length) {
+                setTimeout(() => { if (onDone) onDone(); }, 200);
+                return;
+            }
+
+            const slot = slots[si++];
+            slot.click();
+
+            // Wait for popover, read it, then move on
+            waitFor('.mab-popover', (popover) => {
+                if (!popover) { nextSlot(); return; }
+                // The MutationObserver in setupObservers will cache the data automatically
+                // Just wait a tick for it to fire then close
+                setTimeout(() => {
+                    const closeBtn = popover.querySelector('.mab-popover-close:not(.mab-popover-danger)');
+                    if (closeBtn) closeBtn.click();
+                    setTimeout(nextSlot, 100);
+                }, 150);
+            }, 1000);
+        }
+
+        nextSlot();
+    }
+
     function refreshPartyStats(onDone) {
         if (inspectBusy) return;
         inspectBusy = true;
@@ -783,14 +963,29 @@
                 if (i >= queue.length) {
                     closeInspectPanel();
                     setTimeout(() => {
+                        // Step 3: Character stats
                         navTo('Character');
-                        waitFor('.cv-stats-grid', (grid) => {
+                        waitFor('.cv-stats-grid, .char-stat-row, .char-panel-label', (grid) => {
                             if (grid) scrapeSelfStats();
+                            // Step 4: experimental UI only — .mab-bar absent on classic UI so this is a no-op
                             setTimeout(() => {
-                                navTo(currentTab === 'Character' ? 'Combat' : currentTab);
-                                inspectBusy = false;
-                                if (onDone) onDone();
-                            }, 300);
+                                if (document.querySelector('.mab-bar')) {
+                                    _log('Experimental UI detected — scraping mab-bar for skill/imbue/aura costs');
+                                    // Nav back to combat first so it doesn't look stuck on character page
+                                    navTo(currentTab === 'Character' ? 'Combat' : currentTab);
+                                    setTimeout(() => {
+                                        scrapeMabBar(() => {
+                                            scrapeSelfStats(); // re-scrape with populated cache
+                                            inspectBusy = false;
+                                            if (onDone) onDone();
+                                        });
+                                    }, 200);
+                                } else {
+                                    navTo(currentTab === 'Character' ? 'Combat' : currentTab);
+                                    inspectBusy = false;
+                                    if (onDone) onDone();
+                                }
+                            }, 200);
                         }, 3000);
                     }, 400);
                     return;
@@ -1534,9 +1729,9 @@
             if (!dragging) return;
             const nx = e.clientX - ox;
             const ny = e.clientY - oy;
-            // Only count as drag if moved more than 4px
             if (Math.abs(nx - bx) > 4 || Math.abs(ny - by) > 4) hasDragged = true;
-            bx = nx; by = ny;
+            bx = Math.min(window.innerWidth - 32, Math.max(0, nx));
+            by = Math.min(window.innerHeight - 32, Math.max(0, ny));
             btn.style.left = bx + 'px';
             btn.style.top  = by + 'px';
         };
@@ -2223,28 +2418,33 @@
         function makeHoldBtn(label, holdMs, onComplete, color) {
             const btn = mkEl('button','invf-import-btn invf-hold-btn', label);
             btn.style.cssText += `;border-color:${color}33;color:${color};height:48px;white-space:normal;text-align:center;line-height:1.3;font-size:10px;`;
-            let holdTimer = null, holdStart = null, holdRaf = null;
+            let holdTimer = null, holdStart = null, holdRaf = null, fired = false;
             function cancel() {
                 clearTimeout(holdTimer); cancelAnimationFrame(holdRaf);
-                holdTimer = holdStart = holdRaf = null;
+                holdTimer = holdStart = holdRaf = null; fired = false;
                 btn.style.background = ''; btn.style.color = color; btn.textContent = label;
             }
             function tick() {
                 if (!holdStart) return;
                 const pct = Math.min(100, ((Date.now()-holdStart)/holdMs)*100);
                 btn.style.background = `linear-gradient(to right,${color}40 ${pct}%,#0a0a18 ${pct}%)`;
-                btn.textContent = pct < 100 ? `${Math.round(pct)}%` : '…';
                 if (pct < 100) holdRaf = requestAnimationFrame(tick);
             }
+            function onDocUp() { if (!fired) cancel(); }
             btn.addEventListener('mousedown', () => {
-                holdStart = Date.now();
+                fired = false; holdStart = Date.now();
+                clearTimeout(holdTimer); cancelAnimationFrame(holdRaf);
                 holdRaf = requestAnimationFrame(tick);
-                holdTimer = setTimeout(() => { cancelAnimationFrame(holdRaf); onComplete(btn, cancel); }, holdMs);
+                holdTimer = setTimeout(() => {
+                    fired = true;
+                    cancelAnimationFrame(holdRaf);
+                    onComplete(btn, cancel);
+                }, holdMs);
+                // Delay so this mousedown's paired mouseup doesn't immediately trigger it
+                setTimeout(() => document.addEventListener('mouseup', onDocUp, { once: true }), 50);
             });
-            btn.addEventListener('mouseup', cancel);
-            btn.addEventListener('mouseleave', cancel);
             btn.addEventListener('touchstart', e => { e.preventDefault(); btn.dispatchEvent(new MouseEvent('mousedown')); });
-            btn.addEventListener('touchend', cancel);
+            btn.addEventListener('touchend', () => { if (!fired) cancel(); });
             return btn;
         }
 
@@ -2704,51 +2904,68 @@
     }
 
     function buildManaBar(stats) {
-        const mpRequired = stats.__mpRequired;
-        const mpActual   = stats.__mpActual;
-        const mpDelta    = stats.__mpDelta;
+        const mpRequired  = stats.__mpRequired;
+        const mpActual    = stats.__mpActual;
+        const mpDelta     = stats.__mpDelta;
+        const breakdown   = stats.__mpBreakdown || [];
         if (!mpRequired || mpRequired === 0) return null;
 
         const wrap = mkEl('div','qol-mana-bar-wrap');
 
-        // Header: title + current regen value
+        // Header: title + surplus/deficit (only here, not repeated below)
         const hdr = mkEl('div','qol-mana-bar-hdr');
         hdr.appendChild(mkEl('span','qol-mana-bar-title','💠 Mana regen'));
         const valEl = mkEl('span','qol-mana-bar-val');
-        valEl.textContent = (mpActual||0).toFixed(1) + ' / 10s';
-        valEl.style.color = mpDelta >= 0 ? '#5DCAA5' : '#ee8866';
+        const regenVal = (mpActual||0).toFixed(1);
+        if (mpDelta >= 0) {
+            valEl.innerHTML = `<span style="color:#5DCAA5">${regenVal}</span> <span style="font-size:8px;color:#5DCAA5;font-weight:400">+${mpDelta.toFixed(1)} surplus</span>`;
+        } else {
+            valEl.innerHTML = `<span style="color:#ee8866">${regenVal}</span> <span style="font-size:8px;color:#ee8866;font-weight:400">−${Math.abs(mpDelta).toFixed(1)} deficit</span>`;
+        }
         hdr.appendChild(valEl);
         wrap.appendChild(hdr);
 
-        // Bar: fill = actual regen as % of max(actual, required)*1.2 so there's headroom
-        const maxVal  = Math.max(mpActual||0, mpRequired) * 1.2;
-        const fillPct = Math.min(100, ((mpActual||0) / maxVal) * 100);
-        const needPct = Math.min(100, (mpRequired / maxVal) * 100);
+        // Stacked segment bar — each source gets a coloured slice
+        const maxVal = Math.max(mpActual||0, mpRequired) * 1.1;
+        const track  = mkEl('div','qol-mana-track');
+        track.style.cssText = 'display:flex;overflow:hidden;border-radius:4px;gap:1px;';
 
-        const track = mkEl('div','qol-mana-track');
-        const fill  = mkEl('div','qol-mana-fill');
-        fill.style.width = fillPct.toFixed(1) + '%';
-        if (mpDelta < 0) fill.style.background = '#ee8866'; // deficit = red
-        track.appendChild(fill);
+        breakdown.forEach(seg => {
+            const pct  = Math.min(100, (seg.value / maxVal) * 100);
+            const col  = MANA_SEG_COLORS[seg.label] || '#555';
+            const fill = mkEl('div','');
+            fill.style.cssText = `height:8px;background:${col};border-radius:2px;flex-shrink:0;`;
+            fill.style.width   = pct.toFixed(2) + '%';
+            fill.title         = `${seg.label}: ${seg.value.toFixed(1)} / 10s`;
+            track.appendChild(fill);
+        });
 
-        // Needle at required threshold
-        const needle = mkEl('div','qol-mana-needle');
-        needle.style.left = needPct.toFixed(1) + '%';
-        track.appendChild(needle);
+        // Regen marker — white line showing where actual regen sits
+        const regenPct = Math.min(100, ((mpActual||0) / maxVal) * 100);
+        const marker   = mkEl('div','');
+        marker.style.cssText = `position:absolute;top:0;left:${regenPct.toFixed(1)}%;width:2px;height:100%;background:rgba(255,255,255,.5);border-radius:1px;pointer-events:none;`;
+        track.style.position = 'relative';
+        track.appendChild(marker);
 
         wrap.appendChild(track);
 
-        // Sub-row: needed + surplus/deficit
-        const sub = mkEl('div','qol-mana-sub');
-        const leftSpan = mkEl('span','', mpRequired.toFixed(1) + ' needed');
-        const rightSpan = mkEl('span','');
-        if (mpDelta >= 0) {
-            rightSpan.innerHTML = '<b style="color:#5DCAA5">+' + mpDelta.toFixed(1) + '</b> surplus';
-        } else {
-            rightSpan.innerHTML = '<b style="color:#ee8866">−' + Math.abs(mpDelta).toFixed(1) + '</b> deficit';
+        // Legend — small coloured dots with label and value
+        if (breakdown.length > 0) {
+            const leg = mkEl('div','');
+            leg.style.cssText = 'display:flex;flex-wrap:wrap;gap:3px 8px;margin-top:4px;';
+            breakdown.forEach(seg => {
+                const col  = MANA_SEG_COLORS[seg.label] || '#555';
+                const item = mkEl('div','');
+                item.style.cssText = 'display:flex;align-items:center;gap:3px;font-size:8px;color:#666;';
+                const dot = mkEl('span','');
+                dot.style.cssText = `width:6px;height:6px;border-radius:50%;background:${col};flex-shrink:0;`;
+                const lbl = mkEl('span','',seg.label+' '+seg.value.toFixed(1));
+                item.append(dot, lbl);
+                leg.appendChild(item);
+            });
+            wrap.appendChild(leg);
         }
-        sub.append(leftSpan, rightSpan);
-        wrap.appendChild(sub);
+
         return wrap;
     }
 
@@ -2778,9 +2995,9 @@
             const btn = mkEl('button','qol-refresh-btn');
             btn.style.cssText = `height:28px;border-color:${color}44;color:${color};white-space:nowrap;text-align:center;line-height:1;font-size:10px;user-select:none;transition:none;`;
             btn.textContent = label;
-            // Fix size during hold — set explicit min-width from initial render
             requestAnimationFrame(() => { btn.style.minWidth = btn.offsetWidth + 'px'; });
             let ht=null, hs=null, hr=null, fired=false;
+
             function cancel() {
                 clearTimeout(ht); cancelAnimationFrame(hr);
                 ht=hs=hr=null; fired=false;
@@ -2792,22 +3009,29 @@
                 btn.style.background=`linear-gradient(to right,${color}33 ${pct}%,#13132a ${pct}%)`;
                 if (pct<100) hr=requestAnimationFrame(tick);
             }
+            function onDocMouseUp() {
+                // Only cancel if we haven't fired yet
+                if (!fired) cancel();
+            }
+
             btn.addEventListener('mousedown', e => {
                 if (e.button !== 0) return;
-                fired=false; hs=Date.now(); // always reset fired on new press
-                clearTimeout(ht); cancelAnimationFrame(hr); // clear any stale timers
+                fired=false;
+                hs=Date.now();
+                clearTimeout(ht); cancelAnimationFrame(hr);
                 hr=requestAnimationFrame(tick);
-                ht=setTimeout(()=>{
+                ht=setTimeout(() => {
                     fired=true;
                     cancelAnimationFrame(hr);
                     btn.style.background=''; btn.textContent='↺ Refreshing…';
                     action(btn, cancel);
                 }, holdMs);
+                // Listen on document so mouseleave doesn't interfere
+                // Delay so this mousedown's paired mouseup doesn't immediately trigger it
+                setTimeout(() => document.addEventListener('mouseup', onDocMouseUp, { once:true }), 50);
             });
-            btn.addEventListener('mouseup',   () => { fired=false; if (ht) cancel(); });
-            btn.addEventListener('mouseleave', () => { fired=false; if (ht) cancel(); });
             btn.addEventListener('touchstart', e => { e.preventDefault(); btn.dispatchEvent(new MouseEvent('mousedown', {button:0})); });
-            btn.addEventListener('touchend',   () => { if (!fired) cancel(); });
+            btn.addEventListener('touchend', () => { if (!fired) cancel(); });
             return btn;
         }
 
@@ -3316,7 +3540,7 @@
     function makeDraggable(c,h){
         let on=false,sx,sy,sl,st;
         h.addEventListener('mousedown',e=>{ if(e.button!==0)return; on=true; sx=e.clientX; sy=e.clientY; const r=c.getBoundingClientRect(); sl=r.left; st=r.top; e.preventDefault(); });
-        document.addEventListener('mousemove',e=>{ if(!on)return; const nl=sl+(e.clientX-sx),nt=st+(e.clientY-sy); c.style.left=nl+'px'; c.style.top=nt+'px'; state.layout.x=nl; state.layout.y=nt; save(); });
+        document.addEventListener('mousemove',e=>{ if(!on)return; const nl=sl+(e.clientX-sx),nt=st+(e.clientY-sy); const r=c.getBoundingClientRect(); const maxL=window.innerWidth-80,maxT=window.innerHeight-40,minL=-r.width+80,minT=0; const cl=Math.min(maxL,Math.max(minL,nl)),ct=Math.min(maxT,Math.max(minT,nt)); c.style.left=cl+'px'; c.style.top=ct+'px'; state.layout.x=cl; state.layout.y=ct; save(); });
         document.addEventListener('mouseup',()=>on=false);
     }
     function makeResizable(c,h){
@@ -3371,6 +3595,62 @@
                 setTimeout(scrapeLeaderboard, 300);
             }
         });
+
+        // ── mab-bar popover observer ──────────────────────────────────────────
+        // Caches skill costs/CDs, active imbue names, and aura MP drain
+        // whenever a popover opens, so calcManaRequired doesn't need live DOM
+        if (!window._shawzMabCache) window._shawzMabCache = { skills:{}, imbues:[], auraMpPer5s:0 };
+        new MutationObserver(() => {
+            const popover = document.querySelector('.mab-popover');
+            if (!popover) return;
+
+            const title = popover.querySelector('.mab-popover-title')?.childNodes[0]?.textContent?.trim() || '';
+
+            // Ability popover — extract mana cost and CDR-adjusted cooldown
+            // mab-ability-pick-cd = total cooldown with CDR applied (what we want)
+            const descText = popover.querySelector('.mab-ability-desc')?.textContent || '';
+            const manaM = descText.match(/(\d+)\s*mana/i);
+            const cdEl  = popover.querySelector('.mab-ability-pick-cd');
+            const cdM   = cdEl?.textContent.match(/([\d.]+)s/);
+            const isOn  = popover.querySelector('.mab-toggle.on') !== null;
+            if (manaM && cdM && title && !title.startsWith('Imbue') && title !== 'Aura') {
+                if (isOn) {
+                    window._shawzMabCache.skills[title] = {
+                        cost: parseFloat(manaM[1]),
+                        cd:   parseFloat(cdM[1])
+                    };
+                } else {
+                    delete window._shawzMabCache.skills[title];
+                }
+                _log('[mab] skill cached:', title, window._shawzMabCache.skills[title]);
+            }
+
+            // Imbue popover — all slots show the same global imbue list, just overwrite
+            const imbueRows = popover.querySelectorAll('.mab-aura-row');
+            if (imbueRows.length && title.startsWith('Imbue')) {
+                window._shawzMabCache.imbues = [...imbueRows]
+                    .filter(r => r.querySelector('.mab-aura-active'))
+                    .map(r => r.getAttribute('title') || r.querySelector('.mab-aura-name')?.textContent?.trim())
+                    .filter(Boolean);
+                _log('[mab] imbues cached:', window._shawzMabCache.imbues);
+            }
+
+            // Aura popover — read MP/5s from selected aura
+            if (title === 'Aura') {
+                const selAura = popover.querySelector('.mab-aura-row.sel');
+                const effect  = selAura?.querySelector('.mab-aura-effect')?.textContent || '';
+                const mpM     = effect.match(/([\d.]+)%?\s*MP\/5s/i);
+                if (mpM) {
+                    const isPct = effect.includes('%');
+                    window._shawzMabCache.auraMpPer5s = isPct
+                        ? { pct: parseFloat(mpM[1]) }
+                        : { flat: parseFloat(mpM[1]) };
+                    _log('[mab] aura cached:', window._shawzMabCache.auraMpPer5s);
+                } else {
+                    window._shawzMabCache.auraMpPer5s = 0;
+                }
+            }
+        }).observe(document.body, { childList:true, subtree:true });
 
         // Inventory changes — skip tooltip elements and our own panel
         new MutationObserver(muts=>{
