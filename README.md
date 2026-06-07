@@ -24,6 +24,21 @@ A quality-of-life addon for [voididle.com](https://voididle.com).
 
 ## Changelog
 
+### 1.2.1
+- Experimental UI (mab-bar) support — skills, imbues and aura read via popover scrape during refresh
+- Mab-bar popovers hidden during scrape so they don't visually appear
+- Inspect modals and party panel hidden during refresh scrape
+- Returns to combat view immediately after collecting inspect buttons
+- Berserk zerk mode — compact toggleable view showing only players and berserk state
+- Zerk mode uses void purple theme with static gradient fill and pulsing edge indicator
+- Smooth berserk depletion via CSS transition synced to remaining seconds
+- Location names removed from party cards, inspect button changed to 🔍
+- Hold-to-execute buttons fixed — no longer fires on release without holding
+- Viewport drag clamped — panel and reopen button cannot leave screen bounds
+- Mana bar upgraded to stacked segment breakdown (skills, aura, imbues per source)
+- Mana warning hidden in zerk mode
+- Refresh speed improvements across player inspect, character scrape and leaderboard
+
 ### 1.2.0
 
 - Berserk tracker — animated per-player bar with smooth depletion, glow states for ready and active
