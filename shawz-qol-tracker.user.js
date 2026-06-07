@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SHaWZ QoL Tracker
 // @namespace    https://github.com/MattShawz/voididle-shawz-qol
-// @version      1.2.0
+// @version      1.2.1
 // @description  QoL addon for voididle.com — Gear Finder with inventory highlighting, Team tab with party stats, berserk tracker, session rates, leaderboard ranks, zone events and more.
 // @author       MattShawz
 // @match        https://voididle.com/*
@@ -150,6 +150,7 @@
         layout:       { x:20, y:80, width:380, height:560, open:true },
         selfName:     null,
         lbRanks:      {},
+        zerkMode:     false,
 
         // Session tracking — arrays of { t: timestamp_ms, v: value }
         session: {
@@ -461,21 +462,32 @@
             state.party[name].zerk = { pct, active, secsLeft };
         });
 
-        // Self from .cc-pm-you card (combat view) or .zerk-wrapper (sidebar) 
+        // Self from .zerk-wrapper (classic UI) or .mab-zerk (experimental UI)
         if (state.selfName) {
-            // Check if self was already read from cc-pm-you card above
             const selfAlreadyRead = state.party[state.selfName]?.zerk;
             if (!selfAlreadyRead) {
-                // Fall back to sidebar .zerk-wrapper
-                const selfFill = document.querySelector('.zerk-bar-fill');
-                if (selfFill) {
-                    const pct = parseFloat(selfFill.style.width) || 0;
-                    const label = document.querySelector('.zerk-bar-label')?.textContent || '';
+                // Experimental UI — .mab-zerk button with height-based fill
+                const mabZerkFill = document.querySelector('.mab-zerk .mab-zerk-fill');
+                if (mabZerkFill) {
+                    const pct = parseFloat(mabZerkFill.style.height) || 0;
+                    const label = document.querySelector('.mab-zerk .mab-zerk-label')?.textContent || '';
                     const active = /\d+s/.test(label);
                     const secM = label.match(/(\d+)s/);
                     const secsLeft = secM ? parseInt(secM[1]) : null;
                     if (!state.party[state.selfName]) state.party[state.selfName] = {};
                     state.party[state.selfName].zerk = { pct, active, secsLeft };
+                } else {
+                    // Classic UI — .zerk-bar-fill with width-based fill
+                    const selfFill = document.querySelector('.zerk-bar-fill');
+                    if (selfFill) {
+                        const pct = parseFloat(selfFill.style.width) || 0;
+                        const label = document.querySelector('.zerk-bar-label')?.textContent || '';
+                        const active = /\d+s/.test(label);
+                        const secM = label.match(/(\d+)s/);
+                        const secsLeft = secM ? parseInt(secM[1]) : null;
+                        if (!state.party[state.selfName]) state.party[state.selfName] = {};
+                        state.party[state.selfName].zerk = { pct, active, secsLeft };
+                    }
                 }
             }
         }
@@ -877,43 +889,177 @@
     //   5. Navigate back to Combat tab
     //   6. Call onDone()
     let inspectBusy = false;
-    // Click through mab-bar slots to populate the skill/imbue/aura cache
+    // Read mab-bar data via React fiber — no popups needed
     function scrapeMabBar(onDone) {
         const mabBar = document.querySelector('.mab-bar');
         if (!mabBar) { if (onDone) onDone(); return; }
 
         if (!window._shawzMabCache) window._shawzMabCache = { skills:{}, imbues:[], auraMpPer5s:0 };
-        // Reset imbues so we don't accumulate stale entries
+        window._shawzMabCache.skills = {};
         window._shawzMabCache.imbues = [];
+        window._shawzMabCache.auraMpPer5s = 0;
 
-        // Collect all clickable slots: abilities, aura, imbue slots
+        function fiberWalk(el, maxDepth) {
+            const fk = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+            if (!fk) return null;
+            let node = el[fk];
+            let depth = 0;
+            while (node && depth < maxDepth) {
+                const p = node.memoizedProps || node.pendingProps || {};
+                if (Object.keys(p).length > 1) return p; // found meaningful props
+                node = node.return;
+                depth++;
+            }
+            return null;
+        }
+
+        function deepFiberSearch(el, maxDepth) {
+            const fk = Object.keys(el).find(k => k.startsWith('__reactFiber') || k.startsWith('__reactInternalInstance'));
+            if (!fk) return [];
+            const results = [];
+            let node = el[fk];
+            let depth = 0;
+            while (node && depth < maxDepth) {
+                const p = node.memoizedProps || node.pendingProps;
+                if (p && typeof p === 'object') results.push(p);
+                node = node.return;
+                depth++;
+            }
+            return results;
+        }
+
+        // ── Abilities ─────────────────────────────────────────────────────────
+        mabBar.querySelectorAll('.mab-group .mab-slot-active').forEach(btn => {
+            const label = btn.getAttribute('aria-label') || '';
+            if (!label || label.startsWith('Imbue') || label.startsWith('Aura') ||
+                label.startsWith('hp') || label.startsWith('mp') || label.startsWith('Scroll') ||
+                label.startsWith('Elixir')) return;
+
+            const propsList = deepFiberSearch(btn, 30);
+            for (const p of propsList) {
+                // Look for ability data in props
+                const ability = p.ability || p.slot?.ability || p.data || p.item;
+                if (ability && (ability.manaCost !== undefined || ability.cooldown !== undefined)) {
+                    const cost = parseFloat(ability.manaCost ?? ability.mana ?? ability.cost ?? 0);
+                    const cd   = parseFloat(ability.cooldown ?? ability.cd ?? ability.cooldownTime ?? 0);
+                    const active = ability.active !== false && ability.enabled !== false && ability.on !== false;
+                    if (cost > 0 && cd > 0 && active) {
+                        const name = ability.name || ability.id || label;
+                        window._shawzMabCache.skills[name] = { cost, cd };
+                        _log('[mab fiber] skill:', name, cost, 'mana /', cd, 's');
+                    }
+                    break;
+                }
+                // Some games store cost/cd directly on props
+                if (p.manaCost !== undefined && p.cooldown !== undefined) {
+                    const cost = parseFloat(p.manaCost ?? 0);
+                    const cd   = parseFloat(p.cooldown ?? 0);
+                    if (cost > 0 && cd > 0) {
+                        window._shawzMabCache.skills[label] = { cost, cd };
+                        _log('[mab fiber] skill (direct):', label, cost, 'mana /', cd, 's');
+                    }
+                    break;
+                }
+            }
+        });
+
+        // ── Imbues ────────────────────────────────────────────────────────────
+        mabBar.querySelectorAll('.mab-group .mab-slot').forEach(btn => {
+            const label = btn.getAttribute('aria-label') || '';
+            if (!label.startsWith('Imbue')) return;
+
+            const propsList = deepFiberSearch(btn, 30);
+            for (const p of propsList) {
+                // Imbue slot should have a list of imbues with on/off state
+                const imbues = p.imbues || p.imbueList || p.slots || p.options;
+                if (Array.isArray(imbues) && imbues.length) {
+                    imbues.forEach(im => {
+                        const name = im.name || im.id || im.label || '';
+                        const on   = im.active !== false && im.enabled !== false && im.on !== false;
+                        if (name && on && !window._shawzMabCache.imbues.includes(name)) {
+                            window._shawzMabCache.imbues.push(name);
+                        }
+                    });
+                    break;
+                }
+                // Might be a single imbue object
+                if (p.imbueName || p.imbue?.name) {
+                    const name = p.imbueName || p.imbue.name;
+                    const on   = p.imbueActive !== false && p.imbue?.active !== false;
+                    if (name && on && !window._shawzMabCache.imbues.includes(name)) {
+                        window._shawzMabCache.imbues.push(name);
+                    }
+                    break;
+                }
+            }
+        });
+
+        // ── Aura ──────────────────────────────────────────────────────────────
+        const auraBtn = mabBar.querySelector('.mab-slot[aria-label^="Aura"]');
+        if (auraBtn) {
+            const propsList = deepFiberSearch(auraBtn, 30);
+            for (const p of propsList) {
+                const aura = p.aura || p.activeAura || p.selectedAura || p.slot?.aura;
+                if (aura) {
+                    // Look for MP drain — could be pct or flat
+                    const mpPct  = aura.mpCostPct ?? aura.manaCostPct ?? aura.mpPercentPerTick ?? null;
+                    const mpFlat = aura.mpCost    ?? aura.manaCost    ?? aura.mpPerTick        ?? null;
+                    if (mpPct  != null) { window._shawzMabCache.auraMpPer5s = { pct:  parseFloat(mpPct)  }; _log('[mab fiber] aura pct:', mpPct); break; }
+                    if (mpFlat != null) { window._shawzMabCache.auraMpPer5s = { flat: parseFloat(mpFlat) }; _log('[mab fiber] aura flat:', mpFlat); break; }
+                }
+            }
+        }
+
+        _log('[mab fiber] cache:', JSON.stringify(window._shawzMabCache));
+
+        // If fiber gave us no skills (prop names differ), fall back to popover clicks
+        const hasSkills = Object.keys(window._shawzMabCache.skills).length > 0;
+        if (!hasSkills) {
+            _warn('[mab fiber] no skills found via fiber — falling back to popover click scrape');
+            scrapeMabBarPopover(onDone);
+        } else {
+            if (onDone) onDone();
+        }
+    }
+
+    // Fallback: original popover-click approach if fiber yields nothing
+    function scrapeMabBarPopover(onDone) {
+        const mabBar = document.querySelector('.mab-bar');
+        if (!mabBar) { if (onDone) onDone(); return; }
+
+        // Inject a style to hide popovers during scrape — they open/close invisibly
+        const hideStyle = document.createElement('style');
+        hideStyle.id = 'shawz-mab-hide';
+        hideStyle.textContent = '.mab-popover { opacity: 0 !important; pointer-events: none !important; }';
+        document.head.appendChild(hideStyle);
+
         const slots = [...mabBar.querySelectorAll('.mab-slot.mab-slot-active, .mab-slot[aria-label^="Aura"], .mab-slot[aria-label^="Imbue"]')]
-            .filter(btn => !btn.querySelector('.mab-slot-plus')); // skip empty slots
+            .filter(btn => !btn.querySelector('.mab-slot-plus'));
 
-        if (!slots.length) { if (onDone) onDone(); return; }
+        if (!slots.length) {
+            hideStyle.remove();
+            if (onDone) onDone();
+            return;
+        }
 
         let si = 0;
         function nextSlot() {
-            // Close any open popover first
             const existing = document.querySelector('.mab-popover');
             if (existing) {
                 const closeBtn = existing.querySelector('.mab-popover-close:not(.mab-popover-danger)');
                 if (closeBtn) closeBtn.click();
             }
-
             if (si >= slots.length) {
-                setTimeout(() => { if (onDone) onDone(); }, 200);
+                setTimeout(() => {
+                    hideStyle.remove();
+                    if (onDone) onDone();
+                }, 200);
                 return;
             }
-
             const slot = slots[si++];
             slot.click();
-
-            // Wait for popover, read it, then move on
             waitFor('.mab-popover', (popover) => {
                 if (!popover) { nextSlot(); return; }
-                // The MutationObserver in setupObservers will cache the data automatically
-                // Just wait a tick for it to fire then close
                 setTimeout(() => {
                     const closeBtn = popover.querySelector('.mab-popover-close:not(.mab-popover-danger)');
                     if (closeBtn) closeBtn.click();
@@ -921,7 +1067,6 @@
                 }, 150);
             }, 1000);
         }
-
         nextSlot();
     }
 
@@ -930,6 +1075,15 @@
         inspectBusy = true;
 
         const currentTab = document.querySelector('.sb-item.active')?.getAttribute('title') || 'Combat';
+
+        // Hide inspect modals and party panel visually during scrape
+        const scrapeStyle = document.createElement('style');
+        scrapeStyle.id = 'shawz-scrape-hide';
+        scrapeStyle.textContent = `
+            .inspect-modal { opacity: 0 !important; pointer-events: none !important; }
+            .sp-panel { opacity: 0 !important; }
+        `;
+        document.head.appendChild(scrapeStyle);
 
         navTo('Party');
         waitFor('.sp-member-row', () => {
@@ -945,6 +1099,9 @@
                     return btn && name ? { name, btn } : null;
                 })
                 .filter(Boolean);
+
+            // Immediately return to combat — inspect modals work from any screen
+            navTo(currentTab === 'Party' ? 'Combat' : currentTab);
 
             let i = 0;
             function closeInspectPanel() {
@@ -963,31 +1120,30 @@
                 if (i >= queue.length) {
                     closeInspectPanel();
                     setTimeout(() => {
-                        // Step 3: Character stats
+                        // Step 3: Character stats — briefly visit Character tab
                         navTo('Character');
                         waitFor('.cv-stats-grid, .char-stat-row, .char-panel-label', (grid) => {
                             if (grid) scrapeSelfStats();
-                            // Step 4: experimental UI only — .mab-bar absent on classic UI so this is a no-op
+                            // Return to combat immediately
+                            navTo(currentTab === 'Character' ? 'Combat' : currentTab);
+                            // Step 4: mab-bar scrape (experimental UI only, invisible)
                             setTimeout(() => {
                                 if (document.querySelector('.mab-bar')) {
-                                    _log('Experimental UI detected — scraping mab-bar for skill/imbue/aura costs');
-                                    // Nav back to combat first so it doesn't look stuck on character page
-                                    navTo(currentTab === 'Character' ? 'Combat' : currentTab);
-                                    setTimeout(() => {
-                                        scrapeMabBar(() => {
-                                            scrapeSelfStats(); // re-scrape with populated cache
-                                            inspectBusy = false;
-                                            if (onDone) onDone();
-                                        });
-                                    }, 200);
+                                    _log('Experimental UI detected — scraping mab-bar');
+                                    scrapeMabBar(() => {
+                                        scrapeSelfStats();
+                                        scrapeStyle.remove();
+                                        inspectBusy = false;
+                                        if (onDone) onDone();
+                                    });
                                 } else {
-                                    navTo(currentTab === 'Character' ? 'Combat' : currentTab);
+                                    scrapeStyle.remove();
                                     inspectBusy = false;
                                     if (onDone) onDone();
                                 }
                             }, 200);
-                        }, 3000);
-                    }, 400);
+                        }, 1500);
+                    }, 150);
                     return;
                 }
 
@@ -995,8 +1151,8 @@
                 btn.click();
                 setTimeout(() => {
                     scrapeInspectPanel(name);
-                    setTimeout(nextInspect, 200);
-                }, 500);
+                    setTimeout(nextInspect, 100);
+                }, 250);
             }
 
             nextInspect();
@@ -1021,7 +1177,7 @@
                         navTo(currentTab === 'Leaderboard' ? 'Combat' : currentTab);
                         inspectBusy = false;
                         if (onDone) onDone();
-                    }, 300);
+                    }, 150);
                     return;
                 }
                 const catName = WEAPON_CATS[wi++];
@@ -1032,15 +1188,15 @@
                     const cb = [...document.querySelectorAll('.lb-cat-btn')]
                         .find(b => b.textContent.trim() === catName);
                     if (cb) cb.click();
-                    setTimeout(() => { scrapeLeaderboard(); nextCat(); }, 150);
-                }, 100);
+                    setTimeout(() => { scrapeLeaderboard(); nextCat(); }, 80);
+                }, 50);
             }
             // Click Combat group first
             const combatGroup = [...document.querySelectorAll('.lb-group-btn')]
                 .find(b => b.textContent.trim() === 'Combat');
-            if (combatGroup) { combatGroup.click(); setTimeout(nextCat, 200); }
+            if (combatGroup) { combatGroup.click(); setTimeout(nextCat, 100); }
             else nextCat();
-        }, 5000);
+        }, 2000);
     }
 
     // Keep refreshAllStats for backwards compat (runs both)
@@ -1585,7 +1741,7 @@
         .qol-player-card.self .qol-player-lv{background:#1a1508;color:#7a6a30;}
         .qol-collapse-arrow{font-size:10px;color:#666;transition:transform .15s;flex-shrink:0;}
         .qol-player-card.expanded .qol-collapse-arrow{transform:rotate(180deg);}
-        .qol-inspect-btn{font-size:9px;padding:2px 7px;border-radius:3px;border:1px solid #2a2a45;background:#14142a;color:#aaa;cursor:pointer;flex-shrink:0;transition:all .1s;}
+        .qol-inspect-btn{font-size:11px;padding:2px 5px;border-radius:3px;border:1px solid #2a2a45;background:#14142a;color:#aaa;cursor:pointer;flex-shrink:0;transition:all .1s;}
         .qol-inspect-btn:hover{color:#c0b8ff;border-color:#7F77DD;}
         .qol-inspect-btn:disabled{opacity:.3;cursor:default;}
         .qol-player-stats{padding:6px 9px 8px;border-top:1px solid #111120;display:flex;flex-direction:column;gap:5px;}
@@ -1618,28 +1774,28 @@
         .qol-updated{font-size:8px;color:#555;text-align:right;}
         .qol-updated.fresh{color:#1D9E75;}
         /* ── Berserk tracker ── */
-        @keyframes zerk-ready-glow{0%,100%{text-shadow:0 0 4px #e8530060,0 0 10px #e8530030}50%{text-shadow:0 0 10px #e85300cc,0 0 22px #e8530066}}
-        @keyframes zerk-active-pulse{0%,100%{text-shadow:0 0 6px #ffcc0080,0 0 14px #ffcc0040;opacity:1}50%{text-shadow:0 0 16px #ffcc00ff,0 0 30px #ffcc0088;opacity:.6}}
-        @keyframes zerk-card-ready{0%,100%{border-color:#1a1a2e}50%{border-color:#e8530077}}
-        @keyframes zerk-card-active{0%,100%{border-color:#ffcc0066}50%{border-color:#ffcc00cc}}
-        @keyframes zerk-bar-sweep{0%{background-position:200% center}100%{background-position:-200% center}}
-        .qol-player-card.zerk-ready{animation:zerk-card-ready 1.8s ease-in-out infinite;}
-        .qol-player-card.zerk-active{animation:zerk-card-active 1s ease-in-out infinite;}
+        @keyframes zerk-ready-glow{0%,100%{text-shadow:0 0 4px #9944ee60,0 0 10px #7722cc30}50%{text-shadow:0 0 10px #aa44ffcc,0 0 22px #9933ee66}}
+        @keyframes zerk-active-pulse{0%,100%{text-shadow:0 0 6px #9944ee80,0 0 14px #7722cc40;opacity:1}50%{text-shadow:0 0 16px #cc88ffff,0 0 30px #aa44ff88;opacity:.6}}
+        @keyframes zerk-card-ready{0%,100%{opacity:.85}50%{opacity:1}}
+        @keyframes zerk-card-active{0%,100%{border-color:#9944ee55}50%{border-color:#aa44ffaa}}
+        @keyframes void-edge-pulse{0%,100%{opacity:.3}50%{opacity:.9}}
+        .qol-player-card.zerk-ready{border-color:#9944ee55!important;animation:zerk-card-ready 2.5s ease-in-out infinite;}
+        .qol-player-card.zerk-active{animation:zerk-card-active 1.5s ease-in-out infinite;}
         .qol-zerk-icon{font-size:10px;line-height:1;color:#2a2a3a;flex-shrink:0;}
-        .qol-zerk-icon.ready{color:#e85300;animation:zerk-ready-glow 1.8s ease-in-out infinite;}
-        .qol-zerk-icon.active{color:#ffcc00;animation:zerk-active-pulse 1s ease-in-out infinite;}
+        .qol-zerk-icon.ready{color:#aa44ff;animation:zerk-ready-glow 2.5s ease-in-out infinite;}
+        .qol-zerk-icon.active{color:#cc88ff;animation:zerk-active-pulse 1.5s ease-in-out infinite;}
         .qol-zerk-badge{font-size:7px;font-weight:700;padding:1px 4px;border-radius:3px;flex-shrink:0;}
-        .qol-zerk-badge.ready{background:#e8530018;color:#e85300;border:1px solid #e8530055;}
-        .qol-zerk-badge.active{background:#ffcc0018;color:#ffcc00;border:1px solid #ffcc0055;}
+        .qol-zerk-badge.ready{background:#9944ee18;color:#aa44ff;border:1px solid #9944ee55;}
+        .qol-zerk-badge.active{background:#7722cc18;color:#cc88ff;border:1px solid #7722cc55;}
         .qol-zerk-row{display:flex;align-items:center;gap:5px;padding:4px 9px;border-top:1px solid #111120;}
         .qol-zerk-lbl{font-size:7px;text-transform:uppercase;letter-spacing:.05em;color:#666;flex-shrink:0;}
-        .qol-zerk-lbl.ready{color:#e85300;}.qol-zerk-lbl.active{color:#ffcc00;}
+        .qol-zerk-lbl.ready{color:#aa44ff;}.qol-zerk-lbl.active{color:#cc88ff;}
         .qol-zerk-track{flex:1;height:4px;background:#111120;border-radius:2px;overflow:hidden;}
         .qol-zerk-fill{height:100%;border-radius:2px;background:#3a3a5a;}
-        .qol-zerk-fill.ready{background:linear-gradient(90deg,#b83000,#e85300);}
-        .qol-zerk-fill.active{background:linear-gradient(90deg,#e85300,#ffcc00,#e85300);background-size:200%;animation:zerk-bar-sweep 1.2s linear infinite;}
+        .qol-zerk-fill.ready{background:linear-gradient(90deg,#2d0d66,#7722cc,#aa44ff);}
+        .qol-zerk-fill.active{background:linear-gradient(90deg,#0a0520,#1d0a55,#4d1aaa,#7722cc);}
         .qol-zerk-pct{font-size:8px;font-weight:700;min-width:26px;text-align:right;color:#666;}
-        .qol-zerk-pct.ready{color:#e85300;}.qol-zerk-pct.active{color:#ffcc00;}
+        .qol-zerk-pct.ready{color:#aa44ff;}.qol-zerk-pct.active{color:#cc88ff;}
         .qol-updated.stale{color:#c6a85c;}
         .qol-updated.old{color:#cc4422;}
         /* Sparkline */
@@ -2975,11 +3131,13 @@
         scrapeSelfStats();
 
         // ── Mana warning ──
-        const warn = getManaWarning();
-        if (warn) {
-            const banner = mkEl('div','invf-mana-warn');
-            banner.innerHTML = `⚠️ <b>Mana deficit</b> −${warn.deficit}/10s &nbsp;·&nbsp; OOM in ~${warn.secsToOOM}s`;
-            body.appendChild(banner);
+        if (!state.zerkMode) {
+            const warn = getManaWarning();
+            if (warn) {
+                const banner = mkEl('div','invf-mana-warn');
+                banner.innerHTML = `⚠️ <b>Mana deficit</b> −${warn.deficit}/10s &nbsp;·&nbsp; OOM in ~${warn.secsToOOM}s`;
+                body.appendChild(banner);
+            }
         }
 
         body.appendChild(mkDivider());
@@ -2987,6 +3145,18 @@
         // ── Party header ──
         const ph = mkEl('div','qol-party-hdr');
         ph.appendChild(mkEl('span','qol-party-title','👥 Party'));
+
+        // Zerk mode toggle
+        const zerkToggle = mkEl('button','qol-refresh-btn');
+        zerkToggle.title = 'Toggle Berserk Mode';
+        zerkToggle.style.cssText = `height:24px;padding:0 8px;font-size:10px;border-color:${state.zerkMode ? '#9944eeaa' : '#2a2a40'};color:${state.zerkMode ? '#aa44ff' : '#555'};background:${state.zerkMode ? 'rgba(153,68,238,.12)' : ''};white-space:nowrap;`;
+        zerkToggle.textContent = '⚡ Zerk';
+        zerkToggle.addEventListener('click', () => {
+            state.zerkMode = !state.zerkMode;
+            save();
+            renderTeamTab(document.getElementById('invf-body'));
+        });
+        ph.appendChild(zerkToggle);
         // ── Two refresh hold buttons ──
         const rfGrid = mkEl('div','');
         rfGrid.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px;';
@@ -3071,6 +3241,111 @@
             return;
         }
 
+        // ── Zerk mode — compact berserk-focused view ──────────────────────────
+        if (state.zerkMode) {
+            const zerkList = mkEl('div','');
+            zerkList.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
+            members.forEach(m => {
+                const zerk = m.zerk || null;
+                const zs = zerk
+                    ? (zerk.active ? 'active' : zerk.pct >= 100 ? 'ready' : 'charging')
+                    : 'none';
+                const pct = zerk ? Math.min(100, zerk.pct) : 0;
+
+                const card = mkEl('div','');
+                card.setAttribute('data-zerk-name', m.name);
+                card.style.cssText = `position:relative;height:38px;border-radius:7px;overflow:hidden;border:1px solid ${
+                    zs==='active' ? '#9944ee55' : zs==='ready' ? '#9944ee44' : m.isSelf ? '#1a0d33' : '#0d0820'
+                };background:${m.isSelf ? '#09060f' : '#060610'};`;
+
+                // Background fill
+                const fill = mkEl('div','');
+                fill.setAttribute('data-zerk-fill','');
+                fill.setAttribute('data-zerk-state', zs);
+                fill.style.cssText = `position:absolute;top:0;left:0;bottom:0;`;
+                if (zs === 'active') {
+                    fill.style.width = pct.toFixed(1)+'%';
+                    fill.style.background = 'linear-gradient(90deg,#0a0520,#1d0a55,#4d1aaa,#7722cc)';
+                    fill.style.backgroundSize = '';
+                    fill.style.animation = '';
+                    // Edge glow — positioned as a sibling so overflow:hidden on fill doesn't clip it
+                    const edge = mkEl('div','');
+                    edge.setAttribute('data-zerk-edge','');
+                    edge.style.cssText = 'position:absolute;top:3px;bottom:3px;width:3px;border-radius:2px;background:#aa44ff;animation:void-edge-pulse 1.5s ease-in-out infinite;pointer-events:none;z-index:2;';
+                    card.appendChild(edge);
+                    // Smooth depletion — transition fill and edge together
+                    if (zerk.secsLeft != null && zerk.secsLeft > 0) {
+                        requestAnimationFrame(() => requestAnimationFrame(() => {
+                            const cardW = card.offsetWidth;
+                            // Set initial edge position in px
+                            edge.style.left = (cardW * pct / 100 - 2) + 'px';
+                            // Now animate both to 0 over secsLeft seconds
+                            fill.style.transition = `width ${zerk.secsLeft}s linear`;
+                            edge.style.transition = `left ${zerk.secsLeft}s linear`;
+                            fill.style.width = '0%';
+                            edge.style.left = '-4px';
+                        }));
+                    } else {
+                        requestAnimationFrame(() => {
+                            edge.style.left = (card.offsetWidth * pct / 100 - 2) + 'px';
+                        });
+                    }
+                } else if (zs === 'ready') {
+                    fill.style.width = '100%';
+                    fill.style.background = 'rgba(153,68,238,.22)';
+                    fill.style.animation = 'void-glow 2.5s ease-in-out infinite';
+                } else {
+                    fill.style.width = pct.toFixed(1)+'%';
+                    fill.style.background = 'linear-gradient(90deg,#0d0820,#1a0d3d)';
+                }
+                card.appendChild(fill);
+
+                // Content
+                const content = mkEl('div','');
+                content.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;padding:0 12px;';
+
+                const nameEl = mkEl('span','');
+                nameEl.style.cssText = `font-size:13px;font-weight:700;color:${m.isSelf ? '#e8c96a' : zs!=='charging'&&zs!=='none' ? '#eeddff' : '#6644aa'};flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;`;
+                nameEl.textContent = m.name;
+                if (m.isSelf) {
+                    const you = mkEl('span','');
+                    you.style.cssText = 'font-size:6px;font-weight:700;padding:1px 3px;border-radius:2px;background:rgba(198,168,92,.15);color:#c6a85c;border:1px solid rgba(198,168,92,.3);vertical-align:middle;margin-left:4px;';
+                    you.textContent = 'YOU';
+                    nameEl.appendChild(you);
+                }
+                content.appendChild(nameEl);
+
+                const stateBox = mkEl('div','');
+                stateBox.style.cssText = 'display:flex;flex-direction:column;align-items:flex-end;flex-shrink:0;';
+
+                const stateVal = mkEl('span','');
+                stateVal.setAttribute('data-zerk-val','');
+                stateVal.style.cssText = `font-size:14px;font-weight:700;line-height:1;color:${
+                    zs==='active' ? '#cc88ff' : zs==='ready' ? '#aa44ff' : '#2a1a55'
+                };`;
+                stateVal.textContent = zs==='active' && zerk.secsLeft
+                    ? zerk.secsLeft+'s'
+                    : zs==='ready' ? 'READY'
+                    : zs==='none' ? '—'
+                    : Math.round(pct)+'%';
+
+                const stateLbl = mkEl('span','');
+                stateLbl.setAttribute('data-zerk-lbl','');
+                stateLbl.style.cssText = `font-size:8px;letter-spacing:.05em;color:${
+                    zs==='active' ? '#7722cc' : zs==='ready' ? '#6611bb' : '#1a0d33'
+                };`;
+                stateLbl.textContent = 'BERSERK' + (zs!=='charging'&&zs!=='none' ? ' ⚡' : '');
+
+                stateBox.append(stateVal, stateLbl);
+                content.appendChild(stateBox);
+                card.appendChild(content);
+                zerkList.appendChild(card);
+            });
+            body.appendChild(zerkList);
+            return;
+        }
+
+        // ── Full mode ─────────────────────────────────────────────────────────
         members.forEach(m => {
             if (state.cardCollapsed[m.name] === undefined)
                 state.cardCollapsed[m.name] = !m.isSelf;
@@ -3148,12 +3423,9 @@
             }
             top.appendChild(nameEl);
 
-            // Zone inline — only show if online
-            if (m.online && m.activity && m.activity!=='—') {
-                const isIdle = /idle/i.test(m.activity);
-                const zone = mkEl('span','qol-zone-inline'+(isIdle?' idle':''),
-                    isIdle ? '💤 Idle' : '⚔ '+m.activity);
-                top.appendChild(zone);
+            // Zone inline — only show idle state, not location name
+            if (m.online && m.activity && /idle/i.test(m.activity)) {
+                top.appendChild(mkEl('span','qol-zone-inline idle','💤 Idle'));
             }
 
             // Berserk icon + badge shown in the zerk row below, not the top row
@@ -3165,7 +3437,7 @@
             top.appendChild(arrow);
 
             if (!m.isSelf) {
-                const inspBtn = mkEl('button','qol-inspect-btn','Inspect');
+                const inspBtn = mkEl('button','qol-inspect-btn','🔍');
                 inspBtn.addEventListener('click',()=>{
                     inspBtn.textContent='…'; inspBtn.disabled=true;
                     navTo('Party');
@@ -3178,7 +3450,7 @@
                         // Return to Combat — inspect panel stays open as overlay
                         setTimeout(()=>{
                             navTo('Combat');
-                            inspBtn.textContent='Inspect';
+                            inspBtn.textContent='🔍';
                             inspBtn.disabled=false;
                         }, 500);
                     },3000);
@@ -3597,58 +3869,59 @@
         });
 
         // ── mab-bar popover observer ──────────────────────────────────────────
-        // Caches skill costs/CDs, active imbue names, and aura MP drain
-        // whenever a popover opens, so calcManaRequired doesn't need live DOM
         if (!window._shawzMabCache) window._shawzMabCache = { skills:{}, imbues:[], auraMpPer5s:0 };
+        let _lastMabPopoverSig = '';
         new MutationObserver(() => {
             const popover = document.querySelector('.mab-popover');
-            if (!popover) return;
-
-            const title = popover.querySelector('.mab-popover-title')?.childNodes[0]?.textContent?.trim() || '';
-
-            // Ability popover — extract mana cost and CDR-adjusted cooldown
-            // mab-ability-pick-cd = total cooldown with CDR applied (what we want)
+            if (!popover) { _lastMabPopoverSig = ''; return; }
+            const titleEl  = popover.querySelector('.mab-popover-title');
             const descText = popover.querySelector('.mab-ability-desc')?.textContent || '';
+            const titleText = titleEl?.textContent?.trim() || '';
+            const sig = titleText + '|' + descText.slice(0, 40);
+            if (sig === _lastMabPopoverSig) return;
+            _lastMabPopoverSig = sig;
+
+            // Extract ability name — text node after the icon span e.g. " Crescendo III"
+            const nameFromTitle = [...(titleEl?.childNodes||[])]
+                .filter(n => n.nodeType === 3 && n.textContent.trim().length > 0)
+                .map(n => n.textContent.trim())
+                .find(t => t.length > 0) || titleText.replace(/^\S+\s*/, '').trim();
+
             const manaM = descText.match(/(\d+)\s*mana/i);
             const cdEl  = popover.querySelector('.mab-ability-pick-cd');
             const cdM   = cdEl?.textContent.match(/([\d.]+)s/);
             const isOn  = popover.querySelector('.mab-toggle.on') !== null;
-            if (manaM && cdM && title && !title.startsWith('Imbue') && title !== 'Aura') {
+            const isImbue = titleText.startsWith('Imbue');
+            const isAura  = titleText === 'Aura';
+
+            if (manaM && cdM && !isImbue && !isAura) {
+                const key = nameFromTitle || titleText;
                 if (isOn) {
-                    window._shawzMabCache.skills[title] = {
-                        cost: parseFloat(manaM[1]),
-                        cd:   parseFloat(cdM[1])
-                    };
+                    window._shawzMabCache.skills[key] = { cost: parseFloat(manaM[1]), cd: parseFloat(cdM[1]) };
                 } else {
-                    delete window._shawzMabCache.skills[title];
+                    delete window._shawzMabCache.skills[key];
                 }
-                _log('[mab] skill cached:', title, window._shawzMabCache.skills[title]);
+                _log('[mab] skill:', key, window._shawzMabCache.skills[key]);
             }
 
-            // Imbue popover — all slots show the same global imbue list, just overwrite
             const imbueRows = popover.querySelectorAll('.mab-aura-row');
-            if (imbueRows.length && title.startsWith('Imbue')) {
+            if (imbueRows.length && isImbue && !_lastMabPopoverSig.includes('__imbuedone')) {
+                _lastMabPopoverSig += '__imbuedone';
                 window._shawzMabCache.imbues = [...imbueRows]
                     .filter(r => r.querySelector('.mab-aura-active'))
                     .map(r => r.getAttribute('title') || r.querySelector('.mab-aura-name')?.textContent?.trim())
                     .filter(Boolean);
-                _log('[mab] imbues cached:', window._shawzMabCache.imbues);
+                _log('[mab] imbues:', window._shawzMabCache.imbues);
             }
 
-            // Aura popover — read MP/5s from selected aura
-            if (title === 'Aura') {
+            if (isAura) {
                 const selAura = popover.querySelector('.mab-aura-row.sel');
                 const effect  = selAura?.querySelector('.mab-aura-effect')?.textContent || '';
                 const mpM     = effect.match(/([\d.]+)%?\s*MP\/5s/i);
-                if (mpM) {
-                    const isPct = effect.includes('%');
-                    window._shawzMabCache.auraMpPer5s = isPct
-                        ? { pct: parseFloat(mpM[1]) }
-                        : { flat: parseFloat(mpM[1]) };
-                    _log('[mab] aura cached:', window._shawzMabCache.auraMpPer5s);
-                } else {
-                    window._shawzMabCache.auraMpPer5s = 0;
-                }
+                window._shawzMabCache.auraMpPer5s = mpM
+                    ? (effect.includes('%') ? { pct: parseFloat(mpM[1]) } : { flat: parseFloat(mpM[1]) })
+                    : 0;
+                _log('[mab] aura:', window._shawzMabCache.auraMpPer5s);
             }
         }).observe(document.body, { childList:true, subtree:true });
 
@@ -3735,6 +4008,97 @@
 
             // Patch existing zerk rows in the team tab without full re-render
             if (state.activeTab !== 'team') return;
+
+            // In zerk mode — patch cards in-place to preserve active CSS transitions
+            if (state.zerkMode) {
+                const body = document.getElementById('invf-body');
+                if (!body) return;
+                const cards = [...body.querySelectorAll('[data-zerk-name]')];
+                if (!cards.length) {
+                    // No cards yet — do initial render
+                    renderTeamTab(body);
+                    return;
+                }
+                cards.forEach(card => {
+                    const name = card.getAttribute('data-zerk-name');
+                    const m    = state.party[name];
+                    if (!m) return;
+                    const zerk = m.zerk || null;
+                    const zs   = zerk ? (zerk.active ? 'active' : zerk.pct >= 100 ? 'ready' : 'charging') : 'none';
+                    const pct  = zerk ? Math.min(100, zerk.pct) : 0;
+                    const fill = card.querySelector('[data-zerk-fill]');
+                    const valEl = card.querySelector('[data-zerk-val]');
+                    const lblEl = card.querySelector('[data-zerk-lbl]');
+                    const alreadyActive = fill?.getAttribute('data-zerk-state') === 'active';
+
+                    // Update border
+                    card.style.borderColor = zs==='active' ? '#9944ee55' : zs==='ready' ? '#9944ee44' : m.isSelf ? '#3a2e08' : '#1a1a2e';
+
+                    // Update fill — skip if already animating active depletion
+                    if (fill) {
+                        if (zs === 'active' && alreadyActive) {
+                            // CSS transition running — leave fill alone, just update text
+                        } else if (zs === 'active') {
+                            fill.setAttribute('data-zerk-state','active');
+                            fill.style.width = pct.toFixed(1)+'%';
+                            fill.style.background = 'linear-gradient(90deg,#0a0520,#1d0a55,#4d1aaa,#7722cc)';
+                            fill.style.backgroundSize = '';
+                            fill.style.animation = '';
+                            // Create or reuse edge element
+                            let edge = card.querySelector('[data-zerk-edge]');
+                            if (!edge) {
+                                edge = document.createElement('div');
+                                edge.setAttribute('data-zerk-edge','');
+                                edge.style.cssText = 'position:absolute;top:3px;bottom:3px;width:3px;border-radius:2px;background:#aa44ff;animation:void-edge-pulse 1.5s ease-in-out infinite;pointer-events:none;z-index:2;';
+                                card.appendChild(edge);
+                            }
+                            if (zerk.secsLeft != null && zerk.secsLeft > 0) {
+                                requestAnimationFrame(() => requestAnimationFrame(() => {
+                                    const cardW = card.offsetWidth;
+                                    edge.style.left = (cardW * pct / 100 - 2) + 'px';
+                                    fill.style.transition = `width ${zerk.secsLeft}s linear`;
+                                    edge.style.transition = `left ${zerk.secsLeft}s linear`;
+                                    fill.style.width = '0%';
+                                    edge.style.left = '-4px';
+                                }));
+                            } else {
+                                requestAnimationFrame(() => {
+                                    edge.style.left = (card.offsetWidth * pct / 100 - 2) + 'px';
+                                });
+                            }
+                        } else if (zs === 'ready') {
+                            // Remove edge if transitioning away from active
+                            card.querySelector('[data-zerk-edge]')?.remove();
+                            fill.setAttribute('data-zerk-state','ready');
+                            fill.style.transition = '';
+                            fill.style.animation = 'void-glow 2.5s ease-in-out infinite';
+                            fill.style.width = '100%';
+                            fill.style.background = 'rgba(153,68,238,.22)';
+                            fill.style.backgroundSize = '';
+                        } else {
+                            card.querySelector('[data-zerk-edge]')?.remove();
+                            fill.setAttribute('data-zerk-state','charging');
+                            fill.style.transition = 'width 0.4s ease';
+                            fill.style.animation = '';
+                            fill.style.width = pct.toFixed(1)+'%';
+                            fill.style.background = 'linear-gradient(90deg,#0d0820,#1a0d3d)';
+                            fill.style.backgroundSize = '';
+                        }
+                    }
+
+                    // Update text
+                    if (valEl) {
+                        valEl.style.color = zs==='active' ? '#cc88ff' : zs==='ready' ? '#aa44ff' : '#2a1a55';
+                        valEl.textContent = zs==='active' && zerk.secsLeft != null
+                            ? zerk.secsLeft+'s' : zs==='ready' ? 'READY' : zs==='none' ? '—' : Math.round(pct)+'%';
+                    }
+                    if (lblEl) {
+                        lblEl.style.color = zs==='active' ? '#7722cc' : zs==='ready' ? '#6611bb' : '#1a0d33';
+                        lblEl.textContent = 'BERSERK' + (zs!=='charging'&&zs!=='none' ? ' ⚡' : '');
+                    }
+                });
+                return;
+            }
             document.querySelectorAll('.qol-player-card').forEach(card => {
                 const nameEl = card.querySelector('.qol-player-name');
                 if (!nameEl) return;
