@@ -464,6 +464,10 @@
         if (!state.settings.weaponPortraits) {
             // Remove any overlay images we previously inserted
             document.querySelectorAll('.shawz-portrait-overlay').forEach(el => el.remove());
+            // Restore visibility of the original portraits we hid underneath
+            document.querySelectorAll('.cc-player-img').forEach(img => {
+                img.style.removeProperty('visibility');
+            });
             return;
         }
         document.querySelectorAll('.cc-pm-card').forEach(card => {
