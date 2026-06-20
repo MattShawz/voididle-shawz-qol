@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SHaWZ QoL Tracker
 // @namespace    https://github.com/MattShawz/voididle-shawz-qol
-// @version      1.3.0
+// @version      1.3.1
 // @description  QoL addon for voididle.com — Gear Finder with inventory highlighting, Team tab with party stats, berserk tracker, session rates, leaderboard ranks, zone events and more.
 // @author       MattShawz
 // @match        https://voididle.com/*
