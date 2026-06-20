@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SHaWZ QoL Tracker
 // @namespace    https://github.com/MattShawz/voididle-shawz-qol
-// @version      1.2.1
+// @version      1.3.0
 // @description  QoL addon for voididle.com — Gear Finder with inventory highlighting, Team tab with party stats, berserk tracker, session rates, leaderboard ranks, zone events and more.
 // @author       MattShawz
 // @match        https://voididle.com/*
@@ -151,6 +151,11 @@
         selfName:     null,
         lbRanks:      {},
         zerkMode:     false,
+        settings: {
+            hideBuffChips:    true,
+            hideBuffIcons:    false,
+            weaponPortraits:  false,
+        },
 
         // Session tracking — arrays of { t: timestamp_ms, v: value }
         session: {
@@ -183,6 +188,8 @@
             if (p.layout)     Object.assign(state.layout, p.layout);
             if (p.activeTab)  state.activeTab = p.activeTab;
             if (p.highlights) Object.assign(state.highlights, p.highlights);
+            if (p.settings)   Object.assign(state.settings, p.settings);
+            if (p.zerkMode !== undefined) state.zerkMode = p.zerkMode;
             if (p.slotConfig) Object.keys(p.slotConfig).forEach(id => {
                 state.slotConfig[id] = p.slotConfig[id];
             });
@@ -224,6 +231,8 @@
                 activeTab:  state.activeTab,
                 highlights: state.highlights,
                 slotConfig: state.slotConfig,
+                settings:   state.settings,
+                zerkMode:   state.zerkMode,
             }));
         } catch(e) {}
     }
@@ -438,6 +447,189 @@
 
     // Read berserk state for all visible party members from .cc-party-grid
     // and for self from .zerk-wrapper. Updates state.party[name].zerk.
+    // ── Weapon class portraits ──────────────────────────────────────────────
+    // Hosted in the repo under /characters/ — override the generic .cc-player-img
+    const PORTRAIT_BASE = 'https://raw.githubusercontent.com/MattShawz/voididle-shawz-qol/main/characters/';
+    const PORTRAIT_MAP = {
+        sword: PORTRAIT_BASE + 'SWORD_512.webp',
+        bow:   PORTRAIT_BASE + 'BOW_512.webp',
+        spear: PORTRAIT_BASE + 'SPEAR_512.webp',
+        staff: PORTRAIT_BASE + 'STAFF_512.webp',
+        harp:  PORTRAIT_BASE + 'HARP_512.webp',
+        fan:   PORTRAIT_BASE + 'FAN_512.webp',
+        guardian: PORTRAIT_BASE + 'GUARDIAN_512.webp?v=2',
+    };
+
+    function applyWeaponPortraits() {
+        if (!state.settings.weaponPortraits) {
+            // Remove any overlay images we previously inserted
+            document.querySelectorAll('.shawz-portrait-overlay').forEach(el => el.remove());
+            return;
+        }
+        document.querySelectorAll('.cc-pm-card').forEach(card => {
+            const name = card.querySelector('.cc-pm-name')?.textContent.trim();
+            if (!name) return;
+
+            // Summoned pets (e.g. spear class "🗿 Frisk's Guardian") aren't
+            // real party members and won't have a weaponType in state.party.
+            // Detect them by the "'s Guardian" naming pattern and apply a
+            // dedicated portrait regardless of the summoner's own weapon.
+            const isGuardian = /'s Guardian$/i.test(name) || name.includes('🗿');
+            const wt = isGuardian ? 'guardian' : state.party[name]?.weaponType;
+            const url = wt && PORTRAIT_MAP[wt];
+            if (!url) return;
+
+            const thumb = card.querySelector('.cc-pm-thumb') || card.querySelector('.cc-pm-thumb-v2');
+            const img   = card.querySelector('.cc-player-img');
+            const mountPoint = thumb || img?.parentElement;
+            if (!mountPoint) return;
+
+            let overlay = mountPoint.querySelector(':scope > .shawz-portrait-overlay');
+
+            // Already showing the correct portrait — nothing to do
+            if (overlay && overlay.getAttribute('data-shawz-portrait') === wt) return;
+
+            if (!overlay) {
+                overlay = document.createElement('img');
+                overlay.className = 'shawz-portrait-overlay';
+                overlay.style.cssText = `
+                    position: absolute; inset: 0; width: 100%; height: 100%;
+                    object-fit: cover; border-radius: inherit; z-index: 5;
+                    pointer-events: none;
+                `;
+                // Ensure the mount point can host an absolutely-positioned child
+                const mp = getComputedStyle(mountPoint).position;
+                if (mp === 'static') mountPoint.style.position = 'relative';
+                mountPoint.appendChild(overlay);
+
+                overlay.onload  = () => _log('[portrait] overlay loaded OK:', wt, url);
+                overlay.onerror = () => _warn('[portrait] overlay FAILED to load:', wt, url);
+            }
+
+            overlay.src = url;
+            overlay.setAttribute('data-shawz-portrait', wt);
+
+            // Hide the original background div underneath rather than fighting it
+            if (img) img.style.setProperty('visibility', 'hidden', 'important');
+        });
+    }
+
+    // ── Live mana tracking ──────────────────────────────────────────────────
+    // Instead of modelling every individual mana-cost source (skills, auras,
+    // imbues — which keeps growing as new mythic abilities are added), we
+    // sample the player's ACTUAL mana value from the combat bar every tick
+    // and derive a real measured regen rate from the deltas. This adapts
+    // automatically to any drain or regen source, dynamic or otherwise.
+    if (!window._shawzManaHistory) window._shawzManaHistory = []; // [{t, val, max}]
+    if (window._shawzManaRateEMA === undefined) window._shawzManaRateEMA = null; // smoothed net rate
+    const MANA_HISTORY_MS = 16000; // keep last 16s of samples — more data to smooth over
+    const MANA_EMA_ALPHA = 0.25;   // smoothing factor — lower = smoother but slower to react
+
+    function sampleLiveMana() {
+        const card = document.querySelector('.cc-pm-card.cc-pm-you .cc-pm-mp-track .cc-bar-intext');
+        if (!card) return null;
+        const m = card.textContent.trim().match(/^([\d,]+)\s*\/\s*([\d,]+)$/);
+        if (!m) return null;
+        const val = parseFloat(m[1].replace(/,/g,''));
+        const max = parseFloat(m[2].replace(/,/g,''));
+        const now = Date.now();
+
+        const hist = window._shawzManaHistory;
+        hist.push({ t: now, val, max });
+        // Trim old samples
+        while (hist.length && now - hist[0].t > MANA_HISTORY_MS) hist.shift();
+
+        return { val, max, now };
+    }
+
+    // Derive empirical mana rates from the sample history.
+    //
+    // ONE-OFF EVENT FILTERING: mythic procs (e.g. "+20% mana after X spells")
+    // and mana potions create a single large jump between two samples. If we
+    // included that delta at full weight in the rate, the displayed number
+    // would spike wildly for a moment then crash back down on the next tick
+    // as the window rolls past it. Instead, any single-tick delta whose
+    // magnitude is way out of line with the recent typical delta is treated
+    // as a discrete EVENT — it still updates "current mana" correctly (next
+    // call to sampleLiveMana already captured the true value), but it's
+    // excluded from the rate trend so the displayed flow stays smooth.
+    //
+    // SMOOTHING: on top of outlier exclusion, the final "net" rate is run
+    // through an exponential moving average (EMA) so it eases toward the
+    // true rate over ~1-2 seconds rather than jumping tick to tick.
+    //
+    // Returns:
+    //   - net:    smoothed mana change per 10s, excluding one-off events —
+    //             this is the headline number, answers "am I trending to OOM"
+    //   - gross:  regen-only portion of net (positive ticks only, same outlier rules)
+    //   - rawNet: unsmoothed net, for debugging/comparison
+    function getEmpiricalManaRate() {
+        const hist = window._shawzManaHistory;
+        if (!hist || hist.length < 2) return null;
+
+        // First pass: collect all per-tick deltas (rate-normalised to /10s)
+        // so we can establish what a "typical" tick looks like.
+        const ticks = [];
+        for (let i = 1; i < hist.length; i++) {
+            const prev = hist[i - 1];
+            const cur  = hist[i];
+            const dt   = cur.t - prev.t;
+            if (dt <= 0 || dt > 4000) continue; // skip gaps (tab inactive, lag, reconnect)
+            const dv = cur.val - prev.val;
+            ticks.push({ dv, dt, ratePerSec: dv / (dt / 1000) });
+        }
+        if (!ticks.length) return null;
+
+        // Typical tick magnitude — median of absolute per-second rates,
+        // used as the baseline to detect outliers against. Median (not
+        // mean) so a single huge proc doesn't drag the baseline up and
+        // mask itself.
+        const absRates = ticks.map(t => Math.abs(t.ratePerSec)).sort((a,b) => a-b);
+        const median = absRates[Math.floor(absRates.length / 2)] || 0;
+        // An event is "one-off" if its magnitude is much larger than the
+        // typical tick — threshold scales with the median so it adapts to
+        // each character's actual regen scale, with a sane floor so it
+        // still catches outliers even when regen is near-zero.
+        const outlierThreshold = Math.max(median * 4, 15); // MP/s
+
+        let netChange = 0, grossGain = 0, elapsedMs = 0;
+        let rawNetChange = 0, rawElapsedMs = 0;
+        for (const t of ticks) {
+            rawElapsedMs += t.dt;
+            rawNetChange += t.dv;
+
+            if (Math.abs(t.ratePerSec) > outlierThreshold) {
+                // One-off event (mythic proc, potion, big spend) — counted
+                // toward elapsed time so the rate doesn't get artificially
+                // inflated by ignoring the time it took, but the magnitude
+                // itself is excluded from the trend.
+                elapsedMs += t.dt;
+                continue;
+            }
+            elapsedMs += t.dt;
+            netChange += t.dv;
+            if (t.dv > 0) grossGain += t.dv;
+        }
+        if (elapsedMs <= 0) return null;
+
+        const rawNet = (netChange / elapsedMs) * 10000;
+        const gross  = (grossGain / elapsedMs) * 10000;
+
+        // Exponential smoothing on top of outlier-filtered rate
+        if (window._shawzManaRateEMA === null) {
+            window._shawzManaRateEMA = rawNet;
+        } else {
+            window._shawzManaRateEMA = MANA_EMA_ALPHA * rawNet + (1 - MANA_EMA_ALPHA) * window._shawzManaRateEMA;
+        }
+
+        return {
+            net: window._shawzManaRateEMA,
+            rawNet,
+            gross,
+            sampleMs: rawElapsedMs,
+        };
+    }
+
     function readBerserkStates() {
         // Clear previous zerk states so offline/absent players don't show stale data
         Object.values(state.party).forEach(p => { delete p.zerk; });
@@ -516,10 +708,17 @@
     const ARCANE_CHARGE_MANA = { 1:5, 2:6, 3:8, 4:9 };
 
     function getAttackIntervalMs() {
-        // Prefer character stats panel — "Attack Speed" e.g. "1.76/s" or "1.76 atk/s"
+        // "Atk Speed" stat — format varies by character UI layout:
+        //   New "MMO" layout: "1.76s"  → this IS the interval in seconds already
+        //   Older layouts:    "1.76/s" or "1.76 atk/s" → this is a RATE (hits/sec)
         const atkRaw = state.party[state.selfName]?.stats?.['Attack Speed'] || '';
         const atkMatch = atkRaw.match(/([\d.]+)/);
-        if (atkMatch) return Math.round(1000 / parseFloat(atkMatch[1]));
+        if (atkMatch) {
+            const num = parseFloat(atkMatch[1]);
+            // If the raw string ends in "s" with no "/" before it, it's an interval already
+            const isInterval = /^\s*[\d.]+\s*s\s*$/i.test(atkRaw);
+            return isInterval ? Math.round(num * 1000) : Math.round(1000 / num);
+        }
         // Fallback: read from combat attack bar animation duration
         const selfCard = document.querySelector('.cc-pm-card.cc-pm-you .cc-attack-bar-fill');
         if (selfCard) {
@@ -666,39 +865,90 @@
     // Read weapon type and image from either .inv-eq-grid or .eq-grid (character panel)
     function readWeaponFromGrid(root) {
         const WEAPON_TYPES = ['sword','bow','spear','staff','harp','fan'];
-        // Structure 1: .inv-eq-grid / .inspect-modal — .equip-slot-compact with .es-label
+
+        // Extract weapon type from an image src path, e.g.
+        // "/Equipment/Harp/Harp Tier 1.webp" -> "harp"
+        // "/Equipment/Bows/Bow Tier 5.webp"   -> "bow"
+        // "/Equipment/Swords/New/Tier 4.webp" -> "sword"
+        // "/Equipment/Spear/Spear Tier 1.webp"-> "spear"
+        function wtFromSrc(src) {
+            if (!src) return '';
+            const lower = src.toLowerCase();
+            if (lower.includes('/harp')) return 'harp';
+            if (lower.includes('/bow'))  return 'bow';
+            if (lower.includes('/spear'))return 'spear';
+            if (lower.includes('/sword'))return 'sword';
+            if (lower.includes('/staff'))return 'staff';
+            if (lower.includes('/fan'))  return 'fan';
+            return '';
+        }
+
+        // If a root is given, search ONLY within it — never fall back to the
+        // whole document, or we risk picking up a stale weapon from another
+        // player's modal / our own character sheet still present in the DOM.
         if (root) {
+            // New "MMO" layout — .cv-mmo-center-weapon .cvm-slot img
+            const mmoWeapon = root.querySelector('.cv-mmo-center-weapon img');
+            if (mmoWeapon) {
+                const src = mmoWeapon.getAttribute('src') || '';
+                const alt = mmoWeapon.getAttribute('alt')?.trim().toLowerCase() || '';
+                // alt is the item display name here, not the type — try matching
+                // it directly first (covers cases where alt happens to be the type),
+                // then fall back to parsing the src path
+                const wt = WEAPON_TYPES.find(w => alt === w) || wtFromSrc(src);
+                if (wt) return { wt, src };
+            }
             const slot1 = [...root.querySelectorAll('.equip-slot-compact.filled')]
                 .find(el => el.querySelector('.es-label')?.textContent.trim().toLowerCase() === 'weapon');
             if (slot1) {
                 const img = slot1.querySelector('img');
                 const alt = img?.getAttribute('alt')?.trim().toLowerCase() || '';
-                const wt = WEAPON_TYPES.find(w => alt === w) || '';
-                if (wt) return { wt, src: img?.getAttribute('src') || '' };
+                const src = img?.getAttribute('src') || '';
+                const wt = WEAPON_TYPES.find(w => alt === w) || wtFromSrc(src);
+                if (wt) return { wt, src };
             }
-            // Structure 2: .eq-grid — .eq-weapon slot
             const slot2 = root.querySelector('.eq-slot.eq-weapon');
             if (slot2) {
                 const img = slot2.querySelector('img.eq-item-img');
                 const alt = img?.getAttribute('alt')?.trim().toLowerCase() || '';
-                const wt = WEAPON_TYPES.find(w => alt === w) || '';
-                if (wt) return { wt, src: img?.getAttribute('src') || '' };
+                const src = img?.getAttribute('src') || '';
+                const wt = WEAPON_TYPES.find(w => alt === w) || wtFromSrc(src);
+                if (wt) return { wt, src };
             }
+            // Root was given but nothing matched inside it — return null,
+            // do NOT fall through to a document-wide search.
+            return null;
         }
-        // Search whole document for either structure
+
+        // No root given (e.g. self-stats scrape with no specific container) —
+        // search the whole document as a last resort, but EXCLUDE anything
+        // inside an open .inspect-modal since that markup is structurally
+        // identical to our own equipped gear and would otherwise contaminate
+        // our own weapon reading with whichever player is currently inspected.
+        const mmoWeapon = document.querySelector('.cv-mmo-center-weapon img');
+        if (mmoWeapon && !mmoWeapon.closest('.inspect-modal')) {
+            const src = mmoWeapon.getAttribute('src') || '';
+            const alt = mmoWeapon.getAttribute('alt')?.trim().toLowerCase() || '';
+            const wt = WEAPON_TYPES.find(w => alt === w) || wtFromSrc(src);
+            if (wt) return { wt, src };
+        }
         const slot1 = [...document.querySelectorAll('.equip-slot-compact.filled')]
+            .filter(el => !el.closest('.inspect-modal'))
             .find(el => el.querySelector('.es-label')?.textContent.trim().toLowerCase() === 'weapon');
         if (slot1) {
             const img = slot1.querySelector('img');
             const alt = img?.getAttribute('alt')?.trim().toLowerCase() || '';
-            const wt = WEAPON_TYPES.find(w => alt === w) || '';
-            if (wt) return { wt, src: img?.getAttribute('src') || '' };
+            const src = img?.getAttribute('src') || '';
+            const wt = WEAPON_TYPES.find(w => alt === w) || wtFromSrc(src);
+            if (wt) return { wt, src };
         }
-        const slot2 = document.querySelector('.eq-slot.eq-weapon img.eq-item-img');
+        const slot2 = [...document.querySelectorAll('.eq-slot.eq-weapon img.eq-item-img')]
+            .find(el => !el.closest('.inspect-modal'));
         if (slot2) {
             const alt = slot2.getAttribute('alt')?.trim().toLowerCase() || '';
-            const wt = WEAPON_TYPES.find(w => alt === w) || '';
-            if (wt) return { wt, src: slot2.getAttribute('src') || '' };
+            const src = slot2.getAttribute('src') || '';
+            const wt = WEAPON_TYPES.find(w => alt === w) || wtFromSrc(src);
+            if (wt) return { wt, src };
         }
         return null;
     }
@@ -727,6 +977,50 @@
                     if (m) stats[m[1] + ' ATK'] = m[2];
                 });
             }
+        }
+
+        // New "MMO" character layout — .cv-mmo-stats / .cvm-stat-row
+        const mmoStats = document.querySelector('.cv-mmo-stats');
+        if (mmoStats) {
+            mmoStats.querySelectorAll('.cvm-stat-row').forEach(row => {
+                const labelEl = row.querySelector('.cvm-stat-label');
+                const valEl   = row.querySelector('.cvm-stat-value');
+                if (!labelEl || !valEl) return;
+                // Label text includes a leading "⌄" caret span — strip it,
+                // keep only the trailing text node(s)
+                const label = [...labelEl.childNodes]
+                    .filter(n => n.nodeType === 3)
+                    .map(n => n.textContent.trim())
+                    .join('')
+                    .trim();
+                const val = valEl.textContent.trim();
+                if (label && val && val !== '—') {
+                    // Normalise label names to match what calcManaRequired/getAttackIntervalMs expect
+                    const NORMALISE = {
+                        'Attack':       'Attack',
+                        'Atk Speed':    'Attack Speed',
+                        'Hit Chance':   'Hit Chance',
+                        'Crit Chance':  'Crit Chance',
+                        'Crit Damage':  'Crit Damage',
+                        'Max HP':       'Max HP',
+                        'Defense':      'Defense',
+                        'HP Regen':     'HP Regen',
+                        'Max Mana':     'Max Mana',
+                        'Mana Regen':   'Mana Regen',
+                        'CDR':          'CDR',
+                        'XP Bonus':     'XP Bonus',
+                        'Gold Bonus':   'Gold Bonus',
+                    };
+                    stats[NORMALISE[label] || label] = val;
+                }
+            });
+            // Power, Phys/Magic ATK from the WEAPON / RANGE section
+            const physAtk = [...mmoStats.querySelectorAll('.cvm-stat-row')]
+                .find(r => r.querySelector('.cvm-stat-label')?.textContent.includes('Phys ATK'));
+            const magAtk = [...mmoStats.querySelectorAll('.cvm-stat-row')]
+                .find(r => r.querySelector('.cvm-stat-label')?.textContent.includes('Magic ATK'));
+            if (physAtk) stats['Physical ATK'] = physAtk.querySelector('.cvm-stat-value')?.textContent.trim();
+            if (magAtk)  stats['Magical ATK']  = magAtk.querySelector('.cvm-stat-value')?.textContent.trim();
         }
 
         // Mana regen calculation — only update if skills panel is visible
@@ -769,10 +1063,24 @@
         state.party[state.selfName].stats     = stats;
         state.party[state.selfName].statsTime = Date.now();
 
-        // Read own weapon type from any visible equipped grid
+        // Read own weapon type from any visible equipped grid.
+        // IMPORTANT: .inv-eq-grid is NOT unique to your own inventory — every
+        // .inspect-modal also contains .inv-eq-grid for the player being
+        // inspected. If an inspect modal happens to be open when this runs,
+        // a bare document.querySelector('.inv-eq-grid') will match THEIR
+        // modal instead of your own equipped tab, silently assigning their
+        // weapon to you. Explicitly exclude anything inside .inspect-modal.
+        function ownInvEqGrid() {
+            const candidates = document.querySelectorAll('.inv-eq-grid');
+            for (const el of candidates) {
+                if (!el.closest('.inspect-modal')) return el;
+            }
+            return null;
+        }
         const selfWeapon = readWeaponFromGrid(
+            document.querySelector('.cv-mmo') ||
             document.querySelector('.eq-grid') ||
-            document.querySelector('.inv-eq-grid')
+            ownInvEqGrid()
         );
         if (selfWeapon?.wt) {
             state.party[state.selfName].weaponType = selfWeapon.wt;
@@ -792,6 +1100,17 @@
         const name = expectedName || state.selfName;
         if (!name) return null;
 
+        // Defense-in-depth: verify the modal is actually showing the player
+        // we expect before trusting its contents. If the modal's displayed
+        // username doesn't match, it's stale (e.g. didn't update from a
+        // previous inspect) — bail out rather than writing wrong data.
+        const modal = document.querySelector('.inspect-modal');
+        const displayedName = modal?.querySelector('.inspect-username')?.textContent.trim();
+        if (displayedName && displayedName !== name) {
+            _warn('[inspect] modal shows "'+displayedName+'" but expected "'+name+'" — skipping stale read');
+            return null;
+        }
+
         if (!state.party[name]) state.party[name] = { name };
 
         const stats = {};
@@ -804,7 +1123,6 @@
         state.party[name].statsTime = Date.now();
 
         // Read weapon type from the inspect modal's equipped grid
-        const modal = document.querySelector('.inspect-modal');
         const inspectWeapon = readWeaponFromGrid(modal);
         if (inspectWeapon?.wt) {
             state.party[name].weaponType = inspectWeapon.wt;
@@ -1100,8 +1418,15 @@
                 })
                 .filter(Boolean);
 
-            // Immediately return to combat — inspect modals work from any screen
-            navTo(currentTab === 'Party' ? 'Combat' : currentTab);
+            // IMPORTANT: stay on the Party panel for the entire inspect loop.
+            // .sp-btn-inspect lives inside .sp-panel — navigating away (even
+            // though the inspect modal renders as an overlay) risks the Party
+            // panel unmounting and detaching these button references from the
+            // live DOM. A detached button's click() can silently no-op,
+            // leaving whatever inspect modal was already open (e.g. the
+            // previous player, or none) on screen — which then gets
+            // misattributed to the next name in the queue. We only navigate
+            // back to the original tab once every inspect has completed.
 
             let i = 0;
             function closeInspectPanel() {
@@ -1120,9 +1445,11 @@
                 if (i >= queue.length) {
                     closeInspectPanel();
                     setTimeout(() => {
+                        // Now safe to leave Party — all inspects are done
+                        navTo(currentTab === 'Party' ? 'Combat' : currentTab);
                         // Step 3: Character stats — briefly visit Character tab
                         navTo('Character');
-                        waitFor('.cv-stats-grid, .char-stat-row, .char-panel-label', (grid) => {
+                        waitFor('.cv-stats-grid, .char-stat-row, .char-panel-label, .cv-mmo-stats', (grid) => {
                             if (grid) scrapeSelfStats();
                             // Return to combat immediately
                             navTo(currentTab === 'Character' ? 'Combat' : currentTab);
@@ -1150,9 +1477,17 @@
                 const { name, btn } = queue[i++];
                 btn.click();
                 setTimeout(() => {
-                    scrapeInspectPanel(name);
-                    setTimeout(nextInspect, 100);
-                }, 250);
+                    const result = scrapeInspectPanel(name);
+                    if (result === null) {
+                        // Modal may not have updated yet — give it one more chance
+                        setTimeout(() => {
+                            scrapeInspectPanel(name);
+                            setTimeout(nextInspect, 100);
+                        }, 300);
+                    } else {
+                        setTimeout(nextInspect, 100);
+                    }
+                }, 400);
             }
 
             nextInspect();
@@ -1948,7 +2283,7 @@
         // Tab bar
         const tabBar = document.createElement('div');
         tabBar.id = 'invf-tabs';
-        [['home','🏠 Home'],['filter','🔍 Gear Finder'],['team','👥 Team']].forEach(([id,lbl]) => {
+        [['home','🏠 Home'],['filter','🔍 Gear Finder'],['team','👥 Team'],['settings','⚙']].forEach(([id,lbl]) => {
             const tb = mkEl('button','invf-tab-btn'+(state.activeTab===id?' active':''),lbl);
             tb.addEventListener('click',()=>{
                 state.activeTab = id;
@@ -2001,6 +2336,7 @@
         body.innerHTML = '';
         if (state.activeTab === 'home')        renderHomeTab(body);
         else if (state.activeTab === 'filter') renderFilterTab(body);
+        else if (state.activeTab === 'settings') renderSettingsTab(body);
         else renderTeamTab(body);
     }
 
@@ -2518,17 +2854,28 @@
     function getManaWarning() {
         const self = state.selfName ? state.party[state.selfName] : null;
         if (!self?.stats) return null;
-        const mpDelta    = self.stats.__mpDelta;
-        const mpRequired = self.stats.__mpRequired;
-        if (mpRequired == null || mpRequired === 0) return null;
-        if (mpDelta >= 0) return null;
-        // Calculate how long until OOM from full mana
-        const maxMana = parseFloat((self.stats['Max Mana'] || '0').replace(/,/g,'')) || 0;
-        const deficit = Math.abs(mpDelta); // MP lost per 10s
-        const secsToOOM = maxMana / (deficit / 10);
+
+        // Use the live measured rate, not the old static prediction model —
+        // this reflects actual mythic abilities, procs, and any dynamic
+        // source automatically.
+        const empirical = getEmpiricalManaRate();
+        if (!empirical || empirical.sampleMs < 2000) return null; // not enough data yet
+        if (empirical.net >= 0) return null; // not in deficit
+
+        // Current mana from the live sample history (most recent point),
+        // falling back to the stats panel if no samples yet
+        const hist = window._shawzManaHistory;
+        const latest = hist && hist.length ? hist[hist.length - 1] : null;
+        const currentMana = latest ? latest.val
+            : parseFloat((self.stats['Mana'] || self.stats['Max Mana'] || '0').replace(/,/g,'')) || 0;
+
+        const deficit = Math.abs(empirical.net); // MP lost per 10s, measured
+        const secsToOOM = currentMana / (deficit / 10);
+
         return {
             deficit: deficit.toFixed(1),
             secsToOOM: Math.round(secsToOOM),
+            currentMana: Math.round(currentMana),
         };
     }
 
@@ -2540,7 +2887,7 @@
             const banner = mkEl('div','invf-mana-warn');
             banner.innerHTML =
                 `⚠️ <b>Mana deficit</b> −${warn.deficit}/10s &nbsp;·&nbsp; `+
-                `OOM in ~${warn.secsToOOM}s &nbsp;·&nbsp; `+
+                `OOM in ~${warn.secsToOOM}s (${warn.currentMana} left) &nbsp;·&nbsp; `+
                 `<span style="color:#aaa">Mana potions recommended</span>`;
             body.appendChild(banner);
         }
@@ -3060,61 +3407,100 @@
     }
 
     function buildManaBar(stats) {
-        const mpRequired  = stats.__mpRequired;
-        const mpActual    = stats.__mpActual;
-        const mpDelta     = stats.__mpDelta;
-        const breakdown   = stats.__mpBreakdown || [];
-        if (!mpRequired || mpRequired === 0) return null;
+        const empirical = getEmpiricalManaRate();
+        const breakdown = stats.__mpBreakdown || [];
+        const mpRequired = stats.__mpRequired; // predicted, used only as fallback/context
+
+        // Need at least a little sample history to show anything meaningful
+        if (!empirical && (!mpRequired || mpRequired === 0)) return null;
 
         const wrap = mkEl('div','qol-mana-bar-wrap');
 
-        // Header: title + surplus/deficit (only here, not repeated below)
+        // Header: live net mana flow (measured, not predicted)
         const hdr = mkEl('div','qol-mana-bar-hdr');
-        hdr.appendChild(mkEl('span','qol-mana-bar-title','💠 Mana regen'));
+        hdr.appendChild(mkEl('span','qol-mana-bar-title','💠 Mana flow'));
         const valEl = mkEl('span','qol-mana-bar-val');
-        const regenVal = (mpActual||0).toFixed(1);
-        if (mpDelta >= 0) {
-            valEl.innerHTML = `<span style="color:#5DCAA5">${regenVal}</span> <span style="font-size:8px;color:#5DCAA5;font-weight:400">+${mpDelta.toFixed(1)} surplus</span>`;
+
+        if (empirical && empirical.sampleMs >= 2000) {
+            const net = empirical.net;
+            if (net >= 0) {
+                valEl.innerHTML = `<span style="color:#5DCAA5">+${net.toFixed(1)}</span> <span style="font-size:8px;color:#5DCAA5;font-weight:400">/10s surplus</span>`;
+            } else {
+                valEl.innerHTML = `<span style="color:#ee8866">${net.toFixed(1)}</span> <span style="font-size:8px;color:#ee8866;font-weight:400">/10s deficit</span>`;
+            }
         } else {
-            valEl.innerHTML = `<span style="color:#ee8866">${regenVal}</span> <span style="font-size:8px;color:#ee8866;font-weight:400">−${Math.abs(mpDelta).toFixed(1)} deficit</span>`;
+            // Not enough samples yet — show a "measuring" state rather than
+            // a stale/predicted number that could be wrong
+            valEl.innerHTML = `<span style="color:#666;font-size:10px;">measuring…</span>`;
         }
         hdr.appendChild(valEl);
         wrap.appendChild(hdr);
 
-        // Stacked segment bar — each source gets a coloured slice
-        const maxVal = Math.max(mpActual||0, mpRequired) * 1.1;
-        const track  = mkEl('div','qol-mana-track');
-        track.style.cssText = 'display:flex;overflow:hidden;border-radius:4px;gap:1px;';
+        // Live bar — shows gross regen vs net flow as two overlapping indicators
+        if (empirical && empirical.sampleMs >= 2000) {
+            const maxVal = Math.max(Math.abs(empirical.gross), Math.abs(empirical.net), mpRequired||0, 10) * 1.15;
+            const zeroPct = 50; // center the zero-point so deficit can show left of it
+            const track = mkEl('div','');
+            track.style.cssText = 'position:relative;height:10px;background:#111120;border-radius:5px;overflow:hidden;';
 
-        breakdown.forEach(seg => {
-            const pct  = Math.min(100, (seg.value / maxVal) * 100);
-            const col  = MANA_SEG_COLORS[seg.label] || '#555';
-            const fill = mkEl('div','');
-            fill.style.cssText = `height:8px;background:${col};border-radius:2px;flex-shrink:0;`;
-            fill.style.width   = pct.toFixed(2) + '%';
-            fill.title         = `${seg.label}: ${seg.value.toFixed(1)} / 10s`;
-            track.appendChild(fill);
-        });
+            // Net flow fill — from center toward + or -
+            const netPct = (empirical.net / maxVal) * 50; // half-width scale either direction
+            const netFill = mkEl('div','');
+            const netClamped = Math.max(-50, Math.min(50, netPct));
+            netFill.style.cssText = `position:absolute;top:0;bottom:0;` +
+                (netClamped >= 0
+                    ? `left:50%;width:${netClamped}%;background:linear-gradient(90deg,#1D9E75,#5DCAA5);`
+                    : `right:50%;width:${-netClamped}%;background:linear-gradient(90deg,#ee8866,#cc4422);`);
+            track.appendChild(netFill);
 
-        // Regen marker — white line showing where actual regen sits
-        const regenPct = Math.min(100, ((mpActual||0) / maxVal) * 100);
-        const marker   = mkEl('div','');
-        marker.style.cssText = `position:absolute;top:0;left:${regenPct.toFixed(1)}%;width:2px;height:100%;background:rgba(255,255,255,.5);border-radius:1px;pointer-events:none;`;
-        track.style.position = 'relative';
-        track.appendChild(marker);
+            // Center zero line
+            const zeroLine = mkEl('div','');
+            zeroLine.style.cssText = 'position:absolute;top:0;bottom:0;left:50%;width:1px;background:rgba(255,255,255,.25);';
+            track.appendChild(zeroLine);
 
-        wrap.appendChild(track);
+            wrap.appendChild(track);
 
-        // Legend — small coloured dots with label and value
+            // Sub-row: gross regen context + sample window
+            const sub = mkEl('div','');
+            sub.style.cssText = 'display:flex;justify-content:space-between;font-size:8px;color:#444;margin-top:3px;';
+            const left = mkEl('span','', `gross regen ${empirical.gross.toFixed(1)}/10s`);
+            const right = mkEl('span','', `${(empirical.sampleMs/1000).toFixed(0)}s sample`);
+            sub.append(left, right);
+            wrap.appendChild(sub);
+        }
+
+        // Predicted breakdown — kept as secondary context for understanding
+        // WHY the rate looks the way it does (skills/aura/imbue contributions).
+        // This is an estimate and may not capture every dynamic source —
+        // the header number above is the one to trust.
         if (breakdown.length > 0) {
-            const leg = mkEl('div','');
-            leg.style.cssText = 'display:flex;flex-wrap:wrap;gap:3px 8px;margin-top:4px;';
+            const predLbl = mkEl('div','');
+            predLbl.style.cssText = 'font-size:7px;color:#333;text-transform:uppercase;letter-spacing:.04em;margin-top:6px;margin-bottom:2px;';
+            predLbl.textContent = 'Estimated cost breakdown';
+            wrap.appendChild(predLbl);
+
+            const maxVal2 = Math.max(...breakdown.map(s=>s.value), mpRequired||0) * 1.1;
+            const track2 = mkEl('div','');
+            track2.style.cssText = 'display:flex;overflow:hidden;border-radius:3px;gap:1px;height:5px;';
             breakdown.forEach(seg => {
-                const col  = MANA_SEG_COLORS[seg.label] || '#555';
+                const pct = Math.min(100, (seg.value / maxVal2) * 100);
+                const col = MANA_SEG_COLORS[seg.label] || '#555';
+                const fill = mkEl('div','');
+                fill.style.cssText = `height:5px;background:${col};border-radius:2px;flex-shrink:0;opacity:.7;`;
+                fill.style.width = pct.toFixed(2)+'%';
+                fill.title = `${seg.label}: ~${seg.value.toFixed(1)}/10s (estimated)`;
+                track2.appendChild(fill);
+            });
+            wrap.appendChild(track2);
+
+            const leg = mkEl('div','');
+            leg.style.cssText = 'display:flex;flex-wrap:wrap;gap:3px 8px;margin-top:3px;';
+            breakdown.forEach(seg => {
+                const col = MANA_SEG_COLORS[seg.label] || '#555';
                 const item = mkEl('div','');
-                item.style.cssText = 'display:flex;align-items:center;gap:3px;font-size:8px;color:#666;';
+                item.style.cssText = 'display:flex;align-items:center;gap:3px;font-size:7px;color:#444;';
                 const dot = mkEl('span','');
-                dot.style.cssText = `width:6px;height:6px;border-radius:50%;background:${col};flex-shrink:0;`;
+                dot.style.cssText = `width:5px;height:5px;border-radius:50%;background:${col};flex-shrink:0;opacity:.7;`;
                 const lbl = mkEl('span','',seg.label+' '+seg.value.toFixed(1));
                 item.append(dot, lbl);
                 leg.appendChild(item);
@@ -3123,6 +3509,75 @@
         }
 
         return wrap;
+    }
+
+    // ── Settings ──────────────────────────────────────────────────────────────
+    function applySettings() {
+        let el = document.getElementById('shawz-settings-css');
+        if (!el) { el = document.createElement('style'); el.id = 'shawz-settings-css'; document.head.appendChild(el); }
+        const rules = [];
+        if (state.settings.hideBuffChips) rules.push('.cc-ability-buffs{display:none!important}');
+        if (state.settings.hideBuffIcons) rules.push('.cc-buff-icons{display:none!important}.cc-pm-buff-row{display:none!important}');
+        el.textContent = rules.join('\n');
+    }
+
+    function renderSettingsTab(body) {
+        body.innerHTML = '';
+        const wrap = mkEl('div','');
+        wrap.style.cssText = 'padding:8px;display:flex;flex-direction:column;gap:5px;';
+
+        function section(label) {
+            const h = mkEl('div','');
+            h.style.cssText = 'font-size:9px;color:#444;text-transform:uppercase;letter-spacing:.07em;font-weight:700;margin-top:8px;margin-bottom:2px;padding-left:2px;';
+            h.textContent = label;
+            wrap.appendChild(h);
+        }
+
+        function toggle(label, desc, key, onToggleOn) {
+            const on  = state.settings[key];
+            const row = mkEl('div','');
+            row.style.cssText = 'display:flex;align-items:center;gap:10px;padding:8px 10px;background:#0a0a14;border:1px solid #1a1a2e;border-radius:5px;cursor:pointer;user-select:none;';
+            row.addEventListener('mouseenter', () => row.style.borderColor = '#2a2a3a');
+            row.addEventListener('mouseleave', () => row.style.borderColor = '#1a1a2e');
+
+            const txt = mkEl('div','');
+            txt.style.cssText = 'flex:1;min-width:0;';
+            const lbl = mkEl('div','');
+            lbl.style.cssText = 'font-size:11px;font-weight:600;color:#c0b8ff;';
+            lbl.textContent = label;
+            const sub = mkEl('div','');
+            sub.style.cssText = 'font-size:9px;color:#3a3a55;margin-top:2px;line-height:1.3;';
+            sub.textContent = desc;
+            txt.append(lbl, sub);
+
+            const pill = mkEl('div','');
+            pill.style.cssText = `width:32px;height:17px;border-radius:9px;flex-shrink:0;position:relative;transition:background .15s;background:${on?'#7F77DD':'#151525'};border:1px solid ${on?'#7F77DD':'#2a2a3a'};`;
+            const knob = mkEl('div','');
+            knob.style.cssText = `position:absolute;top:2px;left:${on?'13px':'2px'};width:11px;height:11px;border-radius:50%;background:${on?'#fff':'#3a3a5a'};transition:left .15s,background .15s;`;
+            pill.appendChild(knob);
+            row.append(txt, pill);
+
+            row.addEventListener('click', () => {
+                const turningOn = !state.settings[key];
+                state.settings[key] = turningOn;
+                applySettings(); save();
+                if (turningOn && onToggleOn) onToggleOn();
+                renderSettingsTab(body);
+            });
+            wrap.appendChild(row);
+        }
+
+        section('Combat UI');
+        toggle('Hide buff descriptions', 'ATK Buff +8% 6s chips below player cards', 'hideBuffChips');
+        toggle('Hide buff icons',        '✨⚔️🛡️ buff icon row on player cards (both UIs)',  'hideBuffIcons');
+        toggle('Weapon class portraits', 'Replace generic portrait with class art based on equipped weapon. Requires ↺ Players & Stats refresh to apply.', 'weaponPortraits', () => {
+            const hint = mkEl('div','');
+            hint.style.cssText = 'font-size:9px;color:#c6a85c;background:rgba(198,168,92,.1);border:1px solid rgba(198,168,92,.3);border-radius:5px;padding:7px 9px;margin-top:4px;line-height:1.4;';
+            hint.textContent = '⚠ Run ↺ Players & Stats on the Team tab now to load portraits for your party.';
+            wrap.appendChild(hint);
+        });
+
+        body.appendChild(wrap);
     }
 
     function renderTeamTab(body) {
@@ -3135,7 +3590,7 @@
             const warn = getManaWarning();
             if (warn) {
                 const banner = mkEl('div','invf-mana-warn');
-                banner.innerHTML = `⚠️ <b>Mana deficit</b> −${warn.deficit}/10s &nbsp;·&nbsp; OOM in ~${warn.secsToOOM}s`;
+                banner.innerHTML = `⚠️ <b>Mana deficit</b> −${warn.deficit}/10s &nbsp;·&nbsp; OOM in ~${warn.secsToOOM}s (${warn.currentMana} left)`;
                 body.appendChild(banner);
             }
         }
@@ -4005,6 +4460,8 @@
         // Updates zerk state and patches the DOM in-place without re-rendering.
         setInterval(() => {
             readBerserkStates();
+            applyWeaponPortraits();
+            sampleLiveMana();
 
             // Patch existing zerk rows in the team tab without full re-render
             if (state.activeTab !== 'team') return;
@@ -4204,6 +4661,7 @@
     // ─── INIT ─────────────────────────────────────────────────────────────────
     function init(){
         loadPersist();
+        applySettings();
         injectStyles();
         buildPanel();
         setupObservers();
